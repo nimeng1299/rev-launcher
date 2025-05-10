@@ -1,0 +1,52 @@
+.titleBar {
+    height: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 0px;
+    background-color: rgba(255, 255, 255, 0);
+    backdrop-filter: blur(10px);
+    position: relative;
+}
+
+.leftSection {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    z-index: 1;
+}
+
+.controls {
+    display: flex;
+    gap: 4px;
+    z-index: 1;
+    flex-direction: row;
+    flex-wrap: nowrap;
+}
+
+.draggable {
+    flex-grow: 1;
+    height: 100%;
+    -webkit-app-region: drag;
+}
+
+/* 按钮基础样式 */
+.toolbarButton {
+    color: inherit;
+    background: transparent;
+    border: none;
+    padding: 6px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background-color 0.2s ease;
+}
+
+.toolbarButton:hover {
+    background-color: rgba(0, 0, 0, 0.1);
+}
+
+.icon {
+    width: 16px;
+    height: 16px;
+    display: block;
+}
