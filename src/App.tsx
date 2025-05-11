@@ -14,10 +14,24 @@ import {
   DismissRegular,
   ListRegular,
   PeopleRegular,
+  SettingsRegular,
   SquareRegular,
 } from "@fluentui/react-icons";
 import { Window } from "@tauri-apps/api/window";
 import { GamesRegular } from "@fluentui/react-icons/fonts";
+import Account from "./account/Account";
+
+const components = {
+  account: () => <Account />,
+  games: () => <div>Games Library</div>,
+  settings: () => <div>Application Settings</div>,
+};
+
+const menuItems = [
+  { key: "account", label: "Account", icon: <PeopleRegular /> },
+  { key: "games", label: "Games", icon: <GamesRegular /> },
+  { key: "settings", label: "Settings", icon: <SettingsRegular /> },
+];
 
 function App() {
   const appWindow = new Window("main");
@@ -33,6 +47,10 @@ function App() {
   };
   const handleClose = () => appWindow.close();
 
+  const [selectedMenu, setSelectedMenu] =
+    useState<keyof typeof components>("account");
+  const CurrentContent = components[selectedMenu];
+
   async function greet() {
     // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
     setGreetMsg(await invoke("greet", { name }));
@@ -42,10 +60,10 @@ function App() {
     <main className="container">
       <div data-tauri-drag-region className={styles.titleBar}>
         <div className={styles.leftSection}>
-          <ToolbarButton
+          {/* <ToolbarButton
             className={styles.toolbarButton}
             icon={<ListRegular />}
-          />
+          /> */}
           <Text>Rev Launcher</Text>
         </div>
         <div data-tauri-drag-region />
@@ -70,26 +88,25 @@ function App() {
 
       <div className={appStyles.layoutContainer}>
         <MenuList className={appStyles.sidebar}>
-          <MenuItem icon={<PeopleRegular />}>Account</MenuItem>
-          <MenuItem icon={<GamesRegular />}>Games</MenuItem>
+          {menuItems.map((item) => (
+            <MenuItem
+              key={item.key}
+              icon={item.icon}
+              onClick={() => setSelectedMenu(item.key)}
+              style={{
+                background:
+                  selectedMenu === item.key ? "rgba(0,0,0,0.1)" : "transparent",
+                borderRadius: "10px",
+                alignItems: "center",
+              }}
+            >
+              {item.label}
+            </MenuItem>
+          ))}
         </MenuList>
 
         <div className={appStyles.mainContent}>
-          <form
-            className="row"
-            onSubmit={(e) => {
-              e.preventDefault();
-              greet();
-            }}
-          >
-            <input
-              id="greet-input"
-              onChange={(e) => setName(e.currentTarget.value)}
-              placeholder="Enter a name..."
-            />
-            <button type="submit">Greet</button>
-          </form>
-          <p>{greetMsg}</p>
+          <CurrentContent />
         </div>
       </div>
     </main>
