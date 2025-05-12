@@ -20,10 +20,11 @@ import {
 import { Window } from "@tauri-apps/api/window";
 import { GamesRegular } from "@fluentui/react-icons/fonts";
 import Account from "./account/Account";
+import Games from "./games/Games";
 
 const components = {
   account: () => <Account />,
-  games: () => <div>Games Library</div>,
+  games: () => <Games />,
   settings: () => <div>Application Settings</div>,
 };
 
@@ -98,6 +99,7 @@ function App() {
                   selectedMenu === item.key ? "rgba(0,0,0,0.1)" : "transparent",
                 borderRadius: "10px",
                 alignItems: "center",
+                paddingLeft: "10px",
               }}
             >
               {item.label}
