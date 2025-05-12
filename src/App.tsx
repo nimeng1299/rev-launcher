@@ -49,7 +49,7 @@ function App() {
   const handleClose = () => appWindow.close();
 
   const [selectedMenu, setSelectedMenu] =
-    useState<keyof typeof components>("account");
+    useState<keyof typeof components>("games");
   const CurrentContent = components[selectedMenu];
 
   async function greet() {
