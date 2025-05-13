@@ -8,8 +8,14 @@ import {
   MenuItem,
 } from "@fluentui/react-components";
 import styles from "./Games.module.css";
-import { PlayRegular, SettingsRegular } from "@fluentui/react-icons";
+import {
+  EditPersonRegular,
+  PlayRegular,
+  SettingsRegular,
+} from "@fluentui/react-icons";
 import { useState } from "react";
+import { AnimatePresence, motion } from "framer-motion";
+import { style } from "motion/react-client";
 
 function Games() {
   const [expanded, setExpanded] = useState(false);
@@ -19,23 +25,75 @@ function Games() {
       <div className={styles.menu}>
         <Menu open={expanded}>
           <MenuTrigger>
-            <MenuButton
+            <Button
               onMouseEnter={() => setExpanded(true)}
               onMouseLeave={() => setExpanded(false)}
+              icon={<PlayRegular />}
+              iconPosition="after"
+              size="large"
+              style={{
+                width: "32px",
+                height: "32px",
+              }}
             >
-              Example
-            </MenuButton>
+              <motion.div
+                animate={{ width: expanded ? 100 : 32 }} // 宽度动画
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  overflow: "hidden",
+                  right: 0,
+                  transformOrigin: "right",
+                }}
+              >
+                {expanded && (
+                  <motion.span
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    style={{ marginLeft: 8 }}
+                  >
+                    Play
+                  </motion.span>
+                )}
+              </motion.div>
+            </Button>
           </MenuTrigger>
           <MenuPopover
             onMouseEnter={() => setExpanded(true)}
             onMouseLeave={() => setExpanded(false)}
+            style={{ overflow: "hidden", alignItems: "flex-end" }}
           >
-            <MenuList
-              style={{ display: "flex", flexDirection: "column", gap: "8px" }}
-            >
-              <MenuItem>Item a</MenuItem>
-              <MenuItem>Item b</MenuItem>
-            </MenuList>
+            <AnimatePresence>
+              {expanded && (
+                <motion.div
+                  initial={{ opacity: 0, y: 10, height: 0 }}
+                  animate={{ opacity: 1, y: 0, height: "auto" }}
+                  exit={{ opacity: 0, y: -10, height: 0 }}
+                >
+                  <MenuList
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: "10px",
+                      alignItems: "flex-end",
+                    }}
+                  >
+                    <MenuItem
+                      className={styles.menu_item}
+                      icon={<SettingsRegular />}
+                    >
+                      setting
+                    </MenuItem>
+                    <MenuItem
+                      className={styles.menu_item}
+                      icon={<EditPersonRegular />}
+                    >
+                      edit
+                    </MenuItem>
+                  </MenuList>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </MenuPopover>
         </Menu>
       </div>

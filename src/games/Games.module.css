@@ -1,5 +1,12 @@
 .menu {
     position: absolute;
-    right: 10px;
-    bottom: 10px;
+    right: 20px;
+    bottom: 20px;
+    overflow: hidden;
+}
+
+.menu_item {
+    align-items: flex-end;
+    border-radius: 5px;
+    flex-direction: row-reverse;
 }
