@@ -4,10 +4,12 @@ import "./App.css";
 import styles from "./TitleBar.module.css";
 import appStyles from "./app.module.css";
 import {
+  FluentProvider,
   MenuItem,
   MenuList,
   Text,
   ToolbarButton,
+  webLightTheme,
 } from "@fluentui/react-components";
 import {
   ArrowMinimizeRegular,
@@ -21,11 +23,12 @@ import { Window } from "@tauri-apps/api/window";
 import { GamesRegular } from "@fluentui/react-icons/fonts";
 import Account from "./account/Account";
 import Games from "./games/Games";
+import Settings from "./settings/Settings";
 
 const components = {
   account: () => <Account />,
   games: () => <Games />,
-  settings: () => <div>Application Settings</div>,
+  settings: () => <Settings />,
 };
 
 const menuItems = [
@@ -59,58 +62,62 @@ function App() {
 
   return (
     <main className="container">
-      <div data-tauri-drag-region className={styles.titleBar}>
-        <div className={styles.leftSection}>
-          {/* <ToolbarButton
+      <FluentProvider theme={webLightTheme}>
+        <div data-tauri-drag-region className={styles.titleBar}>
+          <div className={styles.leftSection}>
+            {/* <ToolbarButton
             className={styles.toolbarButton}
             icon={<ListRegular />}
           /> */}
-          <Text>Rev Launcher</Text>
+            <Text>Rev Launcher</Text>
+          </div>
+          <div data-tauri-drag-region />
+          <div>
+            <ToolbarButton
+              aria-label="Minimize"
+              icon={<ArrowMinimizeRegular />}
+              onClick={handleMinimize}
+            />
+            <ToolbarButton
+              aria-label={isMaximized ? "Restore" : "Maximize"}
+              icon={isMaximized ? <SquareRegular /> : <SquareRegular />}
+              onClick={handleToggleMaximize}
+            />
+            <ToolbarButton
+              aria-label="Close"
+              icon={<DismissRegular />}
+              onClick={handleClose}
+            />
+          </div>
         </div>
-        <div data-tauri-drag-region />
-        <div>
-          <ToolbarButton
-            aria-label="Minimize"
-            icon={<ArrowMinimizeRegular />}
-            onClick={handleMinimize}
-          />
-          <ToolbarButton
-            aria-label={isMaximized ? "Restore" : "Maximize"}
-            icon={isMaximized ? <SquareRegular /> : <SquareRegular />}
-            onClick={handleToggleMaximize}
-          />
-          <ToolbarButton
-            aria-label="Close"
-            icon={<DismissRegular />}
-            onClick={handleClose}
-          />
-        </div>
-      </div>
 
-      <div className={appStyles.layoutContainer}>
-        <MenuList className={appStyles.sidebar}>
-          {menuItems.map((item) => (
-            <MenuItem
-              key={item.key}
-              icon={item.icon}
-              onClick={() => setSelectedMenu(item.key)}
-              style={{
-                background:
-                  selectedMenu === item.key ? "rgba(0,0,0,0.1)" : "transparent",
-                borderRadius: "10px",
-                alignItems: "center",
-                paddingLeft: "10px",
-              }}
-            >
-              {item.label}
-            </MenuItem>
-          ))}
-        </MenuList>
+        <div className={appStyles.layoutContainer}>
+          <MenuList className={appStyles.sidebar}>
+            {menuItems.map((item) => (
+              <MenuItem
+                key={item.key}
+                icon={item.icon}
+                onClick={() => setSelectedMenu(item.key)}
+                style={{
+                  background:
+                    selectedMenu === item.key
+                      ? "rgba(0,0,0,0.1)"
+                      : "transparent",
+                  borderRadius: "10px",
+                  alignItems: "center",
+                  paddingLeft: "10px",
+                }}
+              >
+                {item.label}
+              </MenuItem>
+            ))}
+          </MenuList>
 
-        <div className={appStyles.mainContent}>
-          <CurrentContent />
+          <div className={appStyles.mainContent}>
+            <CurrentContent />
+          </div>
         </div>
-      </div>
+      </FluentProvider>
     </main>
   );
 }

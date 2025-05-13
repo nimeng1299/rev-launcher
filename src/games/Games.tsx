@@ -2,7 +2,6 @@ import {
   Button,
   Menu,
   MenuTrigger,
-  MenuButton,
   MenuPopover,
   MenuList,
   MenuItem,
@@ -32,12 +31,11 @@ function Games() {
               iconPosition="after"
               size="large"
               style={{
-                width: "32px",
                 height: "32px",
               }}
             >
               <motion.div
-                animate={{ width: expanded ? 100 : 32 }} // 宽度动画
+                animate={{ width: expanded ? 60 : 0 }} // 宽度动画
                 style={{
                   display: "flex",
                   alignItems: "center",
