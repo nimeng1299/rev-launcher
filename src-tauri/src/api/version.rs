@@ -1,3 +1,4 @@
+#[derive(Debug)]
 pub struct Version {
     major: u32,
     minor: Option<u32>,
@@ -56,14 +57,74 @@ impl std::fmt::Display for Version {
             }
         }
         if let Some(pre_release) = &self.pre_release {
-            write!(f, "-{}", pre_release)?;
+            write!(f, " {}", pre_release)?;
         }
         Ok(())
     }
 }
 
+impl Version {
+    pub fn from_string(s: &String, ingore: Option<&Vec<char>>) -> Result<Self, String> {
+        let mut index = 0;
+        let mut start = false;
+        let mut end = false;
+        let mut v = vec![];
+        let mut end_str = "".to_string();
+        for ch in s.chars() {
+            if ingore.is_some() && ingore.unwrap().contains(&ch) {
+                continue;
+            }
+            if end {
+                end_str.push(ch);
+                continue;
+            }
+            if ch.is_ascii_digit() {
+                if !start {
+                    start = true;
+                    v.push(0_u32);
+                }
+                v[index] = v[index] * 10 + (ch as u32 - '0' as u32);
+            } else {
+                if start {
+                    index += 1;
+                    start = false;
+                }
+                if index >= 3 {
+                    end = true;
+                    end_str.push(ch);
+                }
+            }
+        }
+        let end_str = end_str.trim();
+        let pre_release = if end_str.is_empty() {
+            None
+        } else {
+            Some(end_str.to_string())
+        };
+        let len = v.len();
+        if len == 0 {
+            return Err("Invalid version string".to_string());
+        }
+        let mut ver = Version {
+            major: v[0],
+            minor: None,
+            patch: None,
+            pre_release: pre_release,
+        };
+        if len >= 2 {
+            ver.minor = Some(v[1]);
+        }
+        if len >= 3 {
+            ver.patch = Some(v[2]);
+        }
+        Ok(ver)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::api::version::Version;
+
     #[test]
     fn display_test() {
         let version = super::Version {
@@ -72,7 +133,7 @@ mod tests {
             patch: Some(0),
             pre_release: Some("alpha".to_string()),
         };
-        assert_eq!(version.to_string(), "1.0.0-alpha");
+        assert_eq!(version.to_string(), "1.0.0 alpha");
 
         let version = super::Version {
             major: 1,
@@ -80,7 +141,7 @@ mod tests {
             patch: None,
             pre_release: Some("alpha".to_string()),
         };
-        assert_eq!(version.to_string(), "1.0-alpha");
+        assert_eq!(version.to_string(), "1.0 alpha");
 
         let version = super::Version {
             major: 1,
@@ -88,7 +149,7 @@ mod tests {
             patch: Some(0),
             pre_release: Some("alpha".to_string()),
         };
-        assert_eq!(version.to_string(), "1-alpha");
+        assert_eq!(version.to_string(), "1 alpha");
 
         let version = super::Version {
             major: 1,
@@ -142,5 +203,52 @@ mod tests {
             pre_release: None,
         };
         assert!(version1 < version2);
+    }
+    #[test]
+    fn from_string_test() {
+        let version = super::Version {
+            major: 1,
+            minor: Some(0),
+            patch: Some(10),
+            pre_release: None,
+        };
+        let version_str = version.to_string();
+        assert!(Version::from_string(&version_str, None).unwrap() == version);
+
+        let version = super::Version {
+            major: 1,
+            minor: Some(0),
+            patch: Some(10),
+            pre_release: Some("s".to_string()),
+        };
+        let version_str = "sad 1 sda0 d10   s".to_string();
+        assert!(Version::from_string(&version_str, None).unwrap() == version);
+
+        let version = super::Version {
+            major: 1,
+            minor: Some(0),
+            patch: Some(10),
+            pre_release: Some("s".to_string()),
+        };
+        let version_str = "sad 1 sda0 d10  \"  s".to_string();
+        assert!(Version::from_string(&version_str, Some(&vec!['"'])).unwrap() == version);
+
+        let version = super::Version {
+            major: 1,
+            minor: Some(0),
+            patch: Some(10),
+            pre_release: Some("\"  s".to_string()),
+        };
+        let version_str = "sad 1 sda0 d10  \"  s   ".to_string();
+        assert!(Version::from_string(&version_str, None).unwrap() == version);
+
+        let version = super::Version {
+            major: 17,
+            minor: Some(0),
+            patch: Some(10),
+            pre_release: Some("2024-01-16 LTS".to_string()),
+        };
+        let version_str = "openjdk version \"17.0.10\" 2024-01-16 LTS".to_string();
+        assert!(Version::from_string(&version_str, Some(&vec!['"'])).unwrap() == version);
     }
 }

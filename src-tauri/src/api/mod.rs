@@ -1,2 +1,2 @@
-mod dirs;
-mod version;
+pub mod dirs;
+pub mod version;
