@@ -2975,6 +2975,7 @@ dependencies = [
 name = "rev-launcher"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "dirs-next",
  "serde",
  "serde_json",

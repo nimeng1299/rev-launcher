@@ -1,4 +1,4 @@
-use std::io::Result;
+use anyhow::{bail, Result};
 use std::path::PathBuf;
 
 pub fn get_config_dirs() -> Result<PathBuf> {
@@ -6,10 +6,7 @@ pub fn get_config_dirs() -> Result<PathBuf> {
         config_dirs.push("rev-launcher");
         return get_and_create_dir(config_dirs);
     } else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "Config directory not found",
-        ));
+        bail!("Config directory not found");
     }
 }
 
