@@ -79,16 +79,19 @@ impl JavaVersions {
 }
 
 impl SettingTrait for JavaVersions {
-    type Output = JavaVersions;
-    fn read_from_file(&self) -> Result<Self> {
-        JavaVersions::load_file_version()
+    fn read_from_file(&self) -> Result<Box<dyn SettingTrait>> {
+        JavaVersions::load_file_version().map(|v| Box::new(v) as Box<dyn SettingTrait>)
     }
     fn write_to_file(&self) -> Result<()> {
         self.save_to_file()
     }
-    fn send(&self) -> Result<(String, Self::Output)> {
-        let json = serde_json::to_string_pretty(self)?;
-        Ok((String::from("java_versions"), self.clone()))
+    fn send(&self) -> Result<(String, serde_json::Value)> {
+        let json = serde_json::to_value(self)?;
+        Ok((String::from("java_versions"), json))
+    }
+    fn receive(&mut self, value: Vec<String>) -> Result<()> {
+        todo!();
+        Ok(())
     }
 }
 

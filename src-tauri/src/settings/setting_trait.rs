@@ -1,11 +1,14 @@
 use anyhow::Result;
 use serde::Serialize;
+use serde_json::Value;
 
-pub trait SettingTrait: Sized {
-    type Output: Serialize;
+pub trait SettingTrait: 'static {
+    //type Output: Serialize;
     //从文件读取，若无文件则为初始化
-    fn read_from_file(&self) -> Result<Self>;
+    fn read_from_file(&self) -> Result<Box<dyn SettingTrait>>;
     fn write_to_file(&self) -> Result<()>;
     //发送给tauri (name, value)
-    fn send(&self) -> Result<(String, Self::Output)>;
+    fn send(&self) -> Result<(String, Value)>;
+    //接收来自tauri的值
+    fn receive(&mut self, value: Vec<String>) -> Result<()>;
 }
