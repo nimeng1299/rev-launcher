@@ -55,9 +55,14 @@ impl JavaVersions {
         versions
     }
 
-    fn load_file_version() -> Result<Self> {
-        let config_path = dirs::get_config_dirs()?;
-        let config_file_path = config_path.join("java_versions.json");
+    fn load_file_version(config_path: Option<PathBuf>) -> Result<Self> {
+        let config_dir;
+        if let Some(path) = config_path {
+            config_dir = path;
+        } else {
+            config_dir = dirs::get_config_dirs()?;
+        }
+        let config_file_path = config_dir.join("java_versions.json");
         if config_file_path.exists() {
             let mut file = File::open(config_file_path)?;
             let mut contents = String::new();
@@ -79,8 +84,8 @@ impl JavaVersions {
 }
 
 impl SettingTrait for JavaVersions {
-    fn read_from_file(&self) -> Result<Box<dyn SettingTrait>> {
-        JavaVersions::load_file_version().map(|v| Box::new(v) as Box<dyn SettingTrait>)
+    fn read_from_file(config_path: Option<PathBuf>) -> Result<Box<dyn SettingTrait>> {
+        JavaVersions::load_file_version(config_path).map(|v| Box::new(v) as Box<dyn SettingTrait>)
     }
     fn write_to_file(&self) -> Result<()> {
         self.save_to_file()
