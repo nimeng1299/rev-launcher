@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use which::which;
 
 use crate::api::dirs;
@@ -55,13 +56,9 @@ impl JavaVersions {
         versions
     }
 
-    fn load_file_version(config_path: Option<PathBuf>) -> Result<Self> {
-        let config_dir;
-        if let Some(path) = config_path {
-            config_dir = path;
-        } else {
-            config_dir = dirs::get_config_dirs()?;
-        }
+    fn load_file_version() -> Result<Self> {
+        let config_dir = dirs::get_config_dirs()?;
+
         let config_file_path = config_dir.join("java_versions.json");
         if config_file_path.exists() {
             let mut file = File::open(config_file_path)?;
@@ -73,22 +70,21 @@ impl JavaVersions {
             return Ok(JavaVersions::load_path_versions());
         }
     }
-
-    fn save_to_file(&self) -> Result<()> {
-        let config_path = dirs::get_config_dirs()?;
-        let config_file_path = config_path.join("java_versions.json");
-        let json = serde_json::to_string_pretty(self)?;
-        File::create(&config_file_path)?.write_all(json.as_bytes())?;
-        Ok(())
-    }
 }
 
 impl SettingTrait for JavaVersions {
-    fn read_from_file(config_path: Option<PathBuf>) -> Result<Box<dyn SettingTrait>> {
-        JavaVersions::load_file_version(config_path).map(|v| Box::new(v) as Box<dyn SettingTrait>)
+    fn read(json: Option<Value>) -> Result<Self> {
+        match json {
+            Some(value) => {
+                let java_versions: JavaVersions = serde_json::from_value(value)?;
+                Ok(java_versions)
+            }
+            None => JavaVersions::load_file_version(),
+        }
     }
-    fn write_to_file(&self) -> Result<()> {
-        self.save_to_file()
+    fn write(&self) -> Result<Value> {
+        serde_json::to_value(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize JavaVersions: {}", e))
     }
     fn send(&self) -> Result<(String, serde_json::Value)> {
         let json = serde_json::to_value(self)?;
