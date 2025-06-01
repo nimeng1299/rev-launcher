@@ -24,12 +24,14 @@ struct JavaVersion {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct JavaVersions {
     versions: Vec<JavaVersion>,
+    select: u8,
 }
 
 impl JavaVersions {
     pub fn new() -> Self {
         JavaVersions {
             versions: Vec::new(),
+            select: 0,
         }
     }
 

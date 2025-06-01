@@ -1,6 +1,8 @@
-use serde::{Deserialize, Serialize};
+use serde::de;
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 pub struct Version {
     major: u32,
     minor: Option<u32>,
@@ -65,6 +67,27 @@ impl std::fmt::Display for Version {
     }
 }
 
+impl Serialize for Version {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut s = serializer.serialize_struct("Version", 1)?;
+        s.serialize_field("value", &self.to_string())?;
+        s.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Version {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &["value"];
+        deserializer.deserialize_struct("Version", FIELDS, VersionVisitor)
+    }
+}
+
 impl Version {
     pub fn from_string(s: &String, ingore: Option<&Vec<char>>) -> Result<Self, String> {
         let mut index = 0;
@@ -120,6 +143,49 @@ impl Version {
             ver.patch = Some(v[2]);
         }
         Ok(ver)
+    }
+}
+
+struct VersionVisitor;
+
+impl<'de> serde::de::Visitor<'de> for VersionVisitor {
+    type Value = Version;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a version string")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut value_opt: Option<String> = None;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "value" => {
+                    if value_opt.is_some() {
+                        return Err(de::Error::duplicate_field("value"));
+                    }
+                    value_opt = Some(map.next_value()?);
+                }
+                // 忽略任何未知字段
+                _ => {
+                    let _ = map.next_value::<de::IgnoredAny>()?;
+                }
+            }
+        }
+        // 检查字段是否存在
+        let value_str = value_opt.ok_or_else(|| de::Error::missing_field("value"))?;
+
+        // 调用 from_string，将错误 (semver::Error) 转换成 serde 的 Error
+        match Version::from_string(&value_str, None) {
+            Ok(ver) => Ok(ver),
+            Err(e) => Err(de::Error::custom(format!(
+                "failed to parse Version from string `{}`: {}",
+                value_str, e
+            ))),
+        }
     }
 }
 
@@ -252,5 +318,17 @@ mod tests {
         };
         let version_str = "openjdk version \"17.0.10\" 2024-01-16 LTS".to_string();
         assert!(Version::from_string(&version_str, Some(&vec!['"'])).unwrap() == version);
+    }
+    #[test]
+    fn de_test() {
+        let version = super::Version {
+            major: 17,
+            minor: Some(0),
+            patch: Some(10),
+            pre_release: Some("2024-01-16 LTS".to_string()),
+        };
+        let json = serde_json::to_string(&version).unwrap();
+        let deserialized: super::Version = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, version);
     }
 }
