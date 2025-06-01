@@ -37,15 +37,22 @@ function JavaSetting(props: SettingProps) {
     const value = e.target.value;
 
     if (value === "add") {
-      //在rust后端实现...
-      // const file = await open({
-      //   title: "选择 Java 可执行文件",
-      //   filters: [{ name: "Java Executable", extensions: ["exe", "bin", ""] }],
-      // });
-
-      if (file) {
-        console.log("选择的 Java 路径：", file);
-        // 这里可以添加逻辑把它加到列表里
+      try {
+        const filters = [["java", ["exe"]]];
+        const directory = "/";
+        const result = await invoke("file_dialog", {
+          filter: filters,
+          setDirectory: directory,
+        });
+        // 处理返回结果
+        if (result) {
+          // 这里可以添加逻辑把它加到列表里
+          console.log("Selected path:", result);
+        } else {
+          console.log("User cancelled the dialog");
+        }
+      } catch (error) {
+        console.error("Error opening file dialog:", error);
       }
 
       return;
