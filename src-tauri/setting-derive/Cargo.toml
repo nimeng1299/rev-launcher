@@ -9,5 +9,4 @@ proc-macro = true
 [dependencies]
 quote = "1"
 syn = { version = "2", features = ["full"] }
-anyhow = "1"
 proc-macro2 = "1"
