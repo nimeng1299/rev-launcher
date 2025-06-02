@@ -7,14 +7,16 @@ use std::{
     sync::{OnceLock, RwLock},
 };
 
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::api::dirs;
 
-use super::setting_manager::SettingManager;
+use super::setting_manager::{ModpackSettingManager, SettingManager};
 
 pub struct Setting {
-    settings: HashMap<i32, SettingManager>,
+    globle: SettingManager,
+    settings: HashMap<i32, ModpackSettingManager>,
 }
 
 impl Setting {
@@ -23,11 +25,19 @@ impl Setting {
         INSTANCE.get_or_init(|| RwLock::new(Self::create()))
     }
 
-    pub fn get(&self, id: i32) -> Option<&SettingManager> {
+    pub fn get_globle(&self) -> &SettingManager {
+        &self.globle
+    }
+
+    pub fn get_globle_mut(&mut self) -> &mut SettingManager {
+        &mut self.globle
+    }
+
+    pub fn get(&self, id: i32) -> Option<&ModpackSettingManager> {
         self.settings.get(&id)
     }
 
-    pub fn get_mut(&mut self, id: i32) -> Option<&mut SettingManager> {
+    pub fn get_mut(&mut self, id: i32) -> Option<&mut ModpackSettingManager> {
         self.settings.get_mut(&id)
     }
 
@@ -61,18 +71,28 @@ impl Setting {
             let modpack_path = PathBuf::from_str(s.modpack_path.as_str()).unwrap();
             settings.insert(
                 id,
-                SettingManager::read(id, modpack_path).expect("Failed to read setting manager"),
+                ModpackSettingManager::read(id, modpack_path)
+                    .expect("Failed to read setting manager"),
             );
         }
 
-        // Add global setting
-        settings.insert(
-            -1,
-            SettingManager::read(-1, dirs::get_config_dirs().unwrap())
-                .expect("Failed to read global setting manager"),
-        );
+        Setting {
+            globle: SettingManager::read().unwrap(),
+            settings,
+        }
+    }
 
-        Setting { settings }
+    pub fn change(&mut self, id: i32, name: String, value: Vec<String>) -> Result<()> {
+        if id == -1 {
+            self.globle.get_setting_mut().change(name, value)?;
+            self.globle.save()?;
+        } else if let Some(setting_manager) = self.settings.get_mut(&id) {
+            setting_manager.get_setting_mut().change(name, value)?;
+            setting_manager.save()?;
+        } else {
+            return Err(anyhow::anyhow!("Setting manager not found for id: {}", id));
+        }
+        Ok(())
     }
 }
 

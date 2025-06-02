@@ -8,7 +8,12 @@ import {
   MenuItem,
   MenuList,
   Text,
+  Toast,
+  Toaster,
+  ToastTitle,
   ToolbarButton,
+  useId,
+  useToastController,
   webLightTheme,
 } from "@fluentui/react-components";
 import {
@@ -38,6 +43,20 @@ const menuItems = [
 ];
 
 function App() {
+  const toasterId = useId("toaster");
+  const { dispatchToast } = useToastController(toasterId);
+  const notify = (
+    intent: "success" | "info" | "warning" | "error",
+    message: string,
+  ) => {
+    dispatchToast(
+      <Toast>
+        <ToastTitle>{message}</ToastTitle>
+      </Toast>,
+      { intent },
+    );
+  };
+
   const appWindow = new Window("main");
   const [greetMsg, setGreetMsg] = useState("");
   const [name, setName] = useState("");
@@ -63,6 +82,7 @@ function App() {
   return (
     <main className="container">
       <FluentProvider theme={webLightTheme}>
+        <Toaster toasterId={toasterId} />
         <div data-tauri-drag-region className={styles.titleBar}>
           <div className={styles.leftSection}>
             {/* <ToolbarButton
