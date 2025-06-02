@@ -26,3 +26,5 @@ dirs-next = "2.0.0"
 which = "7.0.3"
 anyhow = "1.0.98"
 rfd = "0.15.3"
+
+setting-derive = { path = "./setting-derive" }

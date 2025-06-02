@@ -60,47 +60,12 @@ impl SettingManager {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, setting_derive::Setting)]
 pub struct Settings {
     java: JavaVersions,
 }
 
-impl Settings {
-    pub fn read(json: Value) -> Result<Self> {
-        let java = JavaVersions::read(json.get("java").cloned())?;
-        Ok(Settings { java })
-    }
-
-    pub fn create() -> Result<Self> {
-        let java = JavaVersions::read(None)?;
-        Ok(Settings { java })
-    }
-
-    pub fn save(&self) -> Result<Value> {
-        let java_value = self.java.write()?;
-        let settings_value = serde_json::json!({
-            "java": java_value,
-        });
-        Ok(settings_value)
-    }
-
-    pub fn get(&self, item_name: String) -> Result<Value> {
-        match item_name.as_str() {
-            "java" => Ok(serde_json::to_value(&self.java)?),
-            _ => Err(anyhow::anyhow!("Item not found")),
-        }
-    }
-
-    pub fn change(&mut self, item_name: String, value: Vec<String>) -> Result<()> {
-        match item_name.as_str() {
-            "java" => {
-                self.java.receive(value)?;
-                Ok(())
-            }
-            _ => Err(anyhow::anyhow!("Item not found")),
-        }
-    }
-}
+impl Settings {}
 
 pub struct ModpackSettingManager {
     id: i32,

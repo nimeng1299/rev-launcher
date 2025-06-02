@@ -88,9 +88,9 @@ impl SettingTrait for JavaVersions {
         serde_json::to_value(self)
             .map_err(|e| anyhow::anyhow!("Failed to serialize JavaVersions: {}", e))
     }
-    fn send(&self) -> Result<(String, serde_json::Value)> {
+    fn send(&self) -> Result<serde_json::Value> {
         let json = serde_json::to_value(self)?;
-        Ok((String::from("java_versions"), json))
+        Ok(json)
     }
     fn receive(&mut self, value: Vec<String>) -> Result<()> {
         todo!();
