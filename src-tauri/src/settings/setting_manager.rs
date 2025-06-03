@@ -126,70 +126,9 @@ impl ModpackSettingManager {
     }
 }
 
+#[derive(setting_derive::ModpackSetting)]
 pub struct ModpackSetting {
     java: Option<JavaVersions>,
 }
 
-impl ModpackSetting {
-    pub fn read(json: Value) -> Result<Self> {
-        let java = JavaVersions::read_modpack(json.get("java").cloned())?;
-        Ok(ModpackSetting { java })
-    }
-
-    pub fn create() -> Result<Self> {
-        Ok(ModpackSetting { java: None })
-    }
-
-    pub fn save(&self) -> Result<Value> {
-        let mut json_data: Map<String, Value> = Map::new();
-
-        Self::save_simple(&mut json_data, "java".to_string(), &self.java)?;
-
-        let result: Value = Value::Object(json_data);
-        Ok(result)
-    }
-
-    fn save_simple(
-        map: &mut Map<String, Value>,
-        key: String,
-        value: &Option<impl SettingTrait>,
-    ) -> Result<()> {
-        if let Some(v) = value {
-            map.insert(key, v.write()?);
-        }
-        Ok(())
-    }
-
-    pub fn get(&self, item_name: String, globle: &Settings) -> Result<Value> {
-        match item_name.as_str() {
-            "java" => self.get_simple(item_name, &self.java, globle),
-            _ => Err(anyhow::anyhow!("Item not found")),
-        }
-    }
-
-    fn get_simple(
-        &self,
-        item_name: String,
-        item: &Option<impl SettingTrait>,
-        globle: &Settings,
-    ) -> Result<Value> {
-        match item {
-            Some(v) => Ok(v.write()?),
-            None => globle.get(item_name),
-        }
-    }
-
-    pub fn change(&mut self, item_name: String, value: Vec<String>) -> Result<()> {
-        match item_name.as_str() {
-            "java" => Self::change_simple(&mut self.java, value),
-            _ => Err(anyhow::anyhow!("Item not found")),
-        }
-    }
-
-    fn change_simple(item: &mut Option<impl SettingTrait>, value: Vec<String>) -> Result<()> {
-        match item {
-            Some(v) => v.receive(value),
-            None => Err(anyhow::anyhow!("Item not found")),
-        }
-    }
-}
+impl ModpackSetting {}

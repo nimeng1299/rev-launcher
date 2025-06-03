@@ -87,7 +87,9 @@ impl Setting {
             self.globle.get_setting_mut().change(name, value)?;
             self.globle.save()?;
         } else if let Some(setting_manager) = self.settings.get_mut(&id) {
-            setting_manager.get_setting_mut().change(name, value)?;
+            setting_manager
+                .get_setting_mut()
+                .change(name, value, self.globle.get_setting())?;
             setting_manager.save()?;
         } else {
             return Err(anyhow::anyhow!("Setting manager not found for id: {}", id));
