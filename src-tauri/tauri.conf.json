@@ -5,7 +5,7 @@
   "identifier": "com.rev-launcher.app",
   "build": {
     "beforeDevCommand": "bun run dev",
-    "devUrl": "http://localhost:5001",
+    "devUrl": "http://localhost:5173",
     "beforeBuildCommand": "bun run build",
     "frontendDist": "../dist"
   },
