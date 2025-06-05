@@ -7,6 +7,7 @@
     import { Minus } from "lucide-svelte";
     import { Maximize } from "lucide-svelte";
     import { X } from "lucide-svelte";
+    import { Play } from "lucide-svelte";
 
     const appWindow = new Window("main");
     let greetMsg = $state("");
@@ -25,30 +26,30 @@
     <div class="background-layer"></div>
     <div data-tauri-drag-region class="titleBar">
         <h1>rev launcher</h1>
-    <div>
-        <button
-            type="button"
-            class="btn-icon preset-tonal-surface"
-            onclick={() => {
-                appWindow.minimize();
-            }}><Minus /></button
-        >
-        <button
-            type="button"
-            class="btn-icon preset-tonal-surface"
-            onclick={() => {
-                appWindow.maximize();
-            }}><Maximize /></button
-        >
-        <button
-            type="button"
-            class="btn-icon preset-tonal-surface"
-            onclick={() => {
-                appWindow.close();
-            }}><X /></button
-        >
+        <div>
+            <button
+                type="button"
+                class="btn-icon preset-tonal-surface"
+                onclick={() => {
+                    appWindow.minimize();
+                }}><Minus /></button
+            >
+            <button
+                type="button"
+                class="btn-icon preset-tonal-surface"
+                onclick={() => {
+                    appWindow.maximize();
+                }}><Maximize /></button
+            >
+            <button
+                type="button"
+                class="btn-icon preset-tonal-surface"
+                onclick={() => {
+                    appWindow.close();
+                }}><X /></button
+            >
+        </div>
     </div>
-</div>
     <button
         type="button"
         class="btn preset-filled"
@@ -56,6 +57,24 @@
             toaster.info({ title: "Toast!" });
         }}>toast</button
     >
+
+    <div style="display: flex;">
+        <div class="nav">
+            <button type="button" class="btn preset-tonal-surface"
+                ><Play /><span>游戏</span></button
+            >
+            <button type="button" class="btn preset-tonal-surface"
+                ><Play /><span>游戏</span></button
+            >
+            <button type="button" class="btn preset-tonal-surface"
+                ><Play /><span>游戏</span></button
+            >
+            <button type="button" class="btn preset-tonal-surface"
+                ><Play /><span>游戏</span></button
+            >
+        </div>
+        <div style="flex: 1;"></div>
+    </div>
 </main>
 
 <style>
@@ -82,5 +101,13 @@
         max-width: 100%;
         padding-top: 5px;
         z-index: 999;
+    }
+
+    .nav {
+        width: 200px;
+        display: flex;
+        flex-direction: column;
+        padding: 2px 10px;
+        gap: 10px;
     }
 </style>
