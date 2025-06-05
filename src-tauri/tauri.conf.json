@@ -5,17 +5,16 @@
   "identifier": "com.rev-launcher.app",
   "build": {
     "beforeDevCommand": "bun run dev",
-    "devUrl": "http://localhost:5173",
+    "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "bun run build",
-    "frontendDist": "../dist"
+    "frontendDist": "../build"
   },
   "app": {
     "windows": [
       {
         "title": "rev-launcher",
         "width": 800,
-        "height": 600,
-        "decorations": false
+        "height": 600
       }
     ],
     "security": {

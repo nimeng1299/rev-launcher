@@ -11,10 +11,10 @@ mod settings;
 ///base
 ///------------------------
 #[tauri::command]
-fn file_dialog(filter: Vec<(String, Vec<String>)>, set_directory: String) -> Option<PathBuf> {
+fn file_dialog(filters: Vec<(String, Vec<String>)>, set_directory: String) -> Option<PathBuf> {
     let mut dialog = FileDialog::new();
-    for i in 0..filter.len() {
-        let (name, fts) = &filter[i];
+    for i in 0..filters.len() {
+        let (name, fts) = &filters[i];
         dialog = dialog.add_filter(name, fts);
     }
     dialog.set_directory(set_directory).pick_file()
