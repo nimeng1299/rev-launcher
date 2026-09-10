@@ -1,0 +1,13 @@
+[package]
+name = "sharingan"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+atomig = { version = "0.4.3", features = ["derive"] }
+atomic_float = "1"
+lockfree = "0.5.1"
+ureq = "3"
+
+[dev-dependencies]
+indicatif = "0.18.6"

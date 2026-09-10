@@ -1,0 +1,19 @@
+[package]
+name = "launcher"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mclib = {workspace = true}
+anyhow = {workspace = true}
+serde = {workspace = true, features = ["derive"] }
+serde_json = {workspace = true}
+smart-default = {workspace = true}
+
+dirs = "7"
+gpui-kit = "0.6"
+rfd = "0.17.2"
+sysinfo = "0.31.4"
+
+[dev-dependencies]
+gpui-kit = { version = "0.6", features = ["test-support"] }

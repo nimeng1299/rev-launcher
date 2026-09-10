@@ -1,0 +1,12 @@
+[package]
+name = "mclib"
+version.workspace = true
+edition.workspace = true
+
+
+[dependencies]
+md5 = {workspace = true}
+optfield = {workspace = true}
+uuid = {workspace = true}
+serde = {workspace = true}
+serde_json = {workspace = true}
