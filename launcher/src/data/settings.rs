@@ -6,12 +6,14 @@ use serde::{Deserialize, Serialize};
 use smart_default::SmartDefault;
 use std::env::current_dir;
 use std::path::PathBuf;
+use mclib::project::game_project::find_all_game_in_project_folder;
 
 const SETTINGS_FILE: &str = "settings.json";
 
 #[derive(Debug, SmartDefault, Deserialize, Serialize)]
 pub struct AppSettings {
     pub project_paths: Vec<PathBuf>,
+    pub select_project_path: Option<PathBuf>,
     #[default(_code = "mclib::java::find_javas()")]
     pub java_versions: Vec<JavaVersion>,
     pub default_java_version: Option<usize>,
@@ -30,6 +32,11 @@ impl AppSettings {
         let filename = path.join(SETTINGS_FILE);
         let context = std::fs::read_to_string(filename).context("Failed to read settings file")?;
         let mut data: Self = serde_json::from_str(&context).context("Failed to parse settings")?;
+
+        for project_path in &data.project_paths {
+            find_all_game_in_project_folder(&project_path);
+        }
+
         data.java_versions = data
             .java_versions
             .iter()

@@ -3,7 +3,7 @@ use crate::window::develop::DevelopPage;
 use crate::window::download::DownloadPage;
 use crate::window::settings::SettingsPage;
 use crate::window::start::StartPage;
-use crate::window::version_control::VersionControlPage;
+use crate::window::version_control::{VersionControlEvent, VersionControlPage};
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{button::*, *};
 use gpui_kit::{
@@ -62,7 +62,35 @@ impl Render for MainWindow {
             .clone();
         let version_control_page = self
             .version_control_page
-            .get_or_insert_with(|| cx.new(|cx| VersionControlPage::new(window, cx)))
+            .get_or_insert_with(|| {
+                let page = cx.new(|cx| VersionControlPage::new(window, cx));
+
+                // 版本管理页请求跳转（下拉框里的「路径管理」）时，切到设置的项目管理页。
+                cx.subscribe_in(
+                    &page,
+                    window,
+                    |this: &mut MainWindow,
+                     _page,
+                     event: &VersionControlEvent,
+                     window,
+                     cx| {
+                        let VersionControlEvent::OpenProjectPathManager = *event;
+
+                        let settings_page = this
+                            .settings_page
+                            .get_or_insert_with(|| cx.new(|cx| SettingsPage::new(window, cx)))
+                            .clone();
+                        settings_page.update(cx, |page, cx| {
+                            page.select_page(SettingsPage::PROJECT_PAGE_INDEX, cx);
+                        });
+
+                        this.set_active_tab(MainPageTab::Settings as usize, window, cx);
+                    },
+                )
+                .detach();
+
+                page
+            })
             .clone();
         let develop_page = self
             .develop_page

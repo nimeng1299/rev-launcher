@@ -32,6 +32,8 @@ pub struct SettingsPage {
 }
 
 impl SettingsPage {
+    /// 「项目管理」页在设置页列表中的下标。
+    pub const PROJECT_PAGE_INDEX: usize = 1;
     /// 「账号管理」页在设置页列表中的下标。
     pub const ACCOUNT_PAGE_INDEX: usize = 3;
 
