@@ -38,6 +38,13 @@ impl Account {
             token,
         }
     }
+
+    /// 判断当前账户的token是否有效
+    pub fn check_token(&self) -> bool {
+        match self.account_type {
+            AccountType::Online | AccountType::Offline | AccountType::Other => true,
+        }
+    }
 }
 
 impl fmt::Display for Account {

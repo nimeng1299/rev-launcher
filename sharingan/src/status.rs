@@ -47,6 +47,16 @@ impl DownloadStatus {
         }
     }
 
+    /// 判断任务是否已成功完成。
+    ///
+    /// 只有状态为 [`DownloadStatus::Failed`] 时返回 `true`。
+    pub fn is_failed(&self) -> bool {
+        match self {
+            DownloadStatus::Failed => true,
+            _ => false,
+        }
+    }
+
     /// 判断任务是否已经结束（无论成功或失败）。
     ///
     /// 状态为 [`DownloadStatus::Succeeded`] 或 [`DownloadStatus::Failed`] 时返回 `true`，
@@ -75,7 +85,7 @@ pub enum DownloadFailure {
     /// 本地 IO 失败（创建目录、创建/读写文件等）。
     IOError(std::io::Error),
     /// 下载完成后的完整性校验失败。
-    ValidationError(String),
+    ValidationError,
     /// 未知原因。
     Unknown,
 }

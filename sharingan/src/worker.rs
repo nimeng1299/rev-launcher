@@ -199,9 +199,9 @@ fn download(task: Arc<Task>) {
         Ok(_) => {
             let temp_filename = task.path().join(task.temp_filename());
             if let Some(validator) = task.validator() {
-                if let Err(reason) = validator(temp_filename.clone()) {
-                    task.change_failure(DownloadFailure::ValidationError(reason));
-                    let _  = std::fs::remove_file(temp_filename);
+                if !validator(temp_filename.clone()) {
+                    task.change_failure(DownloadFailure::ValidationError);
+                    let _ = std::fs::remove_file(temp_filename);
                     return;
                 }
             }

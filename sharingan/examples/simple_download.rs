@@ -64,12 +64,10 @@ fn main() {
             .path(std::env::current_dir().unwrap().join("test"))
             .filename("test10mb.bin".to_string())
             .overwrite(true)
-            .validator(|path|{
-                if std::fs::metadata(&path).map_err(|e|e.to_string())?.len() > u64::MAX {
-                    Ok(())
-                }else {
-                    Err(format!("download failed: {}", path.to_string_lossy()))
-                }
+            .validator(|path| {
+                std::fs::metadata(&path)
+                    .map(|metadata| metadata.len() > u64::MAX)
+                    .unwrap_or(false)
             })
             .build()
     });
@@ -82,12 +80,10 @@ fn main() {
                 .path(std::env::current_dir().unwrap().join("test"))
                 .filename(format!("test{}.bin", i))
                 .overwrite(true)
-                .validator(move |path|{
-                    if std::fs::metadata(&path).map_err(|e|e.to_string())?.len() > min_len {
-                        Ok(())
-                    }else {
-                        Err(format!("download failed: {}", path.to_string_lossy()))
-                    }
+                .validator(move |path| {
+                    std::fs::metadata(&path)
+                        .map(|metadata| metadata.len() > min_len)
+                        .unwrap_or(false)
                 })
                 .build()
         });

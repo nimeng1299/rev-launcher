@@ -69,11 +69,7 @@ impl Render for MainWindow {
                 cx.subscribe_in(
                     &page,
                     window,
-                    |this: &mut MainWindow,
-                     _page,
-                     event: &VersionControlEvent,
-                     window,
-                     cx| {
+                    |this: &mut MainWindow, _page, event: &VersionControlEvent, window, cx| {
                         let VersionControlEvent::OpenProjectPathManager = *event;
 
                         let settings_page = this

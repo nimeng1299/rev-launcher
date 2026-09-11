@@ -11,7 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 下载完成后对文件进行完整性校验的回调。
-pub type DownloadValidator = Arc<dyn Fn(PathBuf) -> Result<(), String> + Send + Sync>;
+///
+/// 回调接收已完整写入并同步到磁盘的临时文件路径：返回 `true` 表示校验通过，
+/// 返回 `false` 表示校验失败。
+pub type DownloadValidator = Arc<dyn Fn(PathBuf) -> bool + Send + Sync>;
 
 /// 一个下载任务。
 ///
@@ -311,11 +314,11 @@ impl TaskBuilder {
 
     /// 设置下载完成后的完整性校验回调。
     ///
-    /// 回调接收已完整写入并同步到磁盘的临时文件路径。返回 `Err` 时，任务会以
+    /// 回调接收已完整写入并同步到磁盘的临时文件路径。返回 `false` 时，任务会以
     /// [`DownloadFailure::ValidationError`] 失败，临时文件随后会被清理。
     pub fn validator<F>(mut self, validator: F) -> Self
     where
-        F: Fn(PathBuf) -> Result<(), String> + Send + Sync + 'static,
+        F: Fn(PathBuf) -> bool + Send + Sync + 'static,
     {
         self.validator = Some(Arc::new(validator));
         self

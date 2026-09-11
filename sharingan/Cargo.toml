@@ -4,10 +4,10 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-atomig = { version = "0.4.3", features = ["derive"] }
-atomic_float = "1"
-lockfree = "0.5.1"
-ureq = "3"
+atomig = { workspace = true, features = ["derive"] }
+atomic_float = {workspace = true}
+lockfree = {workspace = true}
+ureq = {workspace = true}
 
 [dev-dependencies]
 indicatif = "0.18.6"

@@ -214,18 +214,13 @@ impl StartPage {
             .and_then(|path| projects.iter().position(|project| &project.path == path))
             .map(IndexPath::new);
 
-        let select_state = cx.new(|cx| {
-            SelectState::new(project_items(&projects), index, window, cx)
-        });
+        let select_state =
+            cx.new(|cx| SelectState::new(project_items(&projects), index, window, cx));
 
         let _select_subscription = cx.subscribe_in(
             &select_state,
             window,
-            |this: &mut Self,
-            _state,
-            event: &SelectEvent<ProjectList>,
-            _window,
-            cx| {
+            |this: &mut Self, _state, event: &SelectEvent<ProjectList>, _window, cx| {
                 let SelectEvent::Confirm(Some(path)) = event else {
                     return;
                 };
@@ -298,7 +293,11 @@ impl StartPage {
 
         let items = project_items(&self.projects);
         let index = selected
-            .and_then(|path| self.projects.iter().position(|project| project.path == path))
+            .and_then(|path| {
+                self.projects
+                    .iter()
+                    .position(|project| project.path == path)
+            })
             .map(IndexPath::new);
 
         self.select_state.update(cx, |state, cx| {

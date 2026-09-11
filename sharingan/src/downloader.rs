@@ -182,6 +182,16 @@ impl Downloader {
         true
     }
 
+    /// 判断所有已提交任务是否均已成功（注意有未完成的任务也会返回false）。
+    pub fn is_all_success(&self) -> bool {
+        for (_, task) in self.tasks.iter() {
+            if !task.status().is_success() {
+                return false;
+            }
+        }
+        true
+    }
+
     /// 返回 Worker 线程句柄列表 `(线程句柄, Worker 序号)`。
     ///
     /// 注意：线程句柄由 `Downloader` 持有，取消后线程自行退出，

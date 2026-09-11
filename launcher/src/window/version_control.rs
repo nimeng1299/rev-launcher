@@ -112,7 +112,8 @@ fn project_row(project: &GameProject) -> AnyElement {
 
 /// 扫一个目录下的所有项目，没选路径时返回空列表。
 fn scan_projects(path: Option<&PathBuf>) -> Vec<GameProject> {
-    path.map(find_all_game_in_project_folder).unwrap_or_default()
+    path.map(find_all_game_in_project_folder)
+        .unwrap_or_default()
 }
 
 /// 当前路径下扫出来的所有项目。
@@ -183,8 +184,8 @@ impl ListDelegate for ProjectListDelegate {
                                 PopupMenuItem::new("刷新")
                                     .icon(IconName::RotateCw)
                                     .on_click(move |_, _, cx| {
-                                        let _ = page
-                                            .update(cx, |page, cx| page.refresh_projects(cx));
+                                        let _ =
+                                            page.update(cx, |page, cx| page.refresh_projects(cx));
                                     }),
                             )
                         })
@@ -247,11 +248,7 @@ impl VersionControlPage {
         let _select_subscription = cx.subscribe_in(
             &select_state,
             window,
-            |this: &mut Self,
-            _state,
-            event: &SelectEvent<Vec<PathOptionItem>>,
-            window,
-            cx| {
+            |this: &mut Self, _state, event: &SelectEvent<Vec<PathOptionItem>>, window, cx| {
                 let SelectEvent::Confirm(value) = event;
 
                 match value {

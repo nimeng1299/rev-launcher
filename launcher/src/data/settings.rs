@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
 use gpui_kit::Global;
 use mclib::java::java_version::JavaVersion;
+use mclib::project::game_project::find_all_game_in_project_folder;
 use mclib::settings::GlobalSettings;
 use serde::{Deserialize, Serialize};
 use smart_default::SmartDefault;
 use std::env::current_dir;
 use std::path::PathBuf;
-use mclib::project::game_project::find_all_game_in_project_folder;
 
 const SETTINGS_FILE: &str = "settings.json";
 

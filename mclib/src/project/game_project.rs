@@ -37,6 +37,22 @@ impl GameProject {
             serde_json::to_string_pretty(self).or_else(|e| Err(GameProjectError::Json(e)))?;
         std::fs::write(filename, data).or_else(|e| Err(GameProjectError::Io(e)))
     }
+
+    ///  读取游戏目录下的<name>.json配置文件
+    pub fn read_json(&self) -> Result<Value, GameProjectError> {
+        let name = self
+            .path
+            .components()
+            .last()
+            .ok_or(GameProjectError::UnknownPath)?
+            .as_os_str()
+            .to_str()
+            .ok_or(GameProjectError::UnknownPath)?;
+        let json_file = self.path.join(format!("{}.json", name));
+        let contents =
+            std::fs::read_to_string(json_file).or_else(|e| Err(GameProjectError::Io(e)))?;
+        from_str(&contents).or_else(|e| Err(GameProjectError::Json(e)))
+    }
 }
 
 /// 获取游戏目录下启动器文件的存放地址
@@ -62,9 +78,10 @@ pub fn find_all_game_in_project_folder(path_buf: &PathBuf) -> Vec<GameProject> {
         }
     }
 
-    dirs.iter().map(|path_buf| get_game_project(path_buf)).filter_map(Result::ok).collect()
-
-
+    dirs.iter()
+        .map(|path_buf| get_game_project(path_buf))
+        .filter_map(Result::ok)
+        .collect()
 }
 
 /// 获取文件夹的游戏版本信息
