@@ -6,9 +6,12 @@ use crate::progress::Progress;
 use crate::status::{DownloadFailure, DownloadStatus};
 use atomig::Atomic;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// 下载完成后对文件进行完整性校验的回调。
+pub type DownloadValidator = Arc<dyn Fn(PathBuf) -> Result<(), String> + Send + Sync>;
 
 /// 一个下载任务。
 ///
@@ -22,7 +25,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// [`progress()`](Task::progress) 观察下载进展，无需额外加锁。
 ///
 /// 两个任务相等的充要条件是 `id` 相同（见 `PartialEq` 实现）。
-#[derive(Debug)]
 pub struct Task {
     /// 任务唯一 id。
     id: usize,
@@ -42,12 +44,34 @@ pub struct Task {
     overwrite: bool,
     /// 网络请求超时时间；`None` 表示不设置全局超时。
     timeout: Option<Duration>,
+    /// 下载完成后对临时文件执行的完整性校验。
+    validator: Option<DownloadValidator>,
     /// 下载状态（原子变量，可跨线程读写）。
     status: Atomic<DownloadStatus>,
     /// 下载失败原因（由 Worker 线程写入）。
     failed_reason: Mutex<DownloadFailure>,
     /// 下载进度。
     progress: Progress,
+}
+
+impl std::fmt::Debug for Task {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Task")
+            .field("id", &self.id)
+            .field("url", &self.url)
+            .field("query", &self.query)
+            .field("header", &self.header)
+            .field("path", &self.path)
+            .field("filename", &self.filename)
+            .field("temp_filename", &self.temp_filename)
+            .field("overwrite", &self.overwrite)
+            .field("timeout", &self.timeout)
+            .field("status", &self.status)
+            .field("failed_reason", &self.failed_reason)
+            .field("progress", &self.progress)
+            .finish()
+    }
 }
 
 impl Task {
@@ -75,6 +99,7 @@ impl Task {
             temp_filename,
             overwrite: builder.overwrite,
             timeout: builder.timeout,
+            validator: builder.validator,
             status: Atomic::new(DownloadStatus::Ready),
             failed_reason: Mutex::new(DownloadFailure::Unknown),
             progress: Progress::default(),
@@ -124,6 +149,11 @@ impl Task {
     /// 返回网络请求超时时间。
     pub fn timeout(&self) -> &Option<Duration> {
         &self.timeout
+    }
+
+    /// 返回下载完成后的完整性校验回调。
+    pub fn validator(&self) -> Option<&DownloadValidator> {
+        self.validator.as_ref()
     }
 
     /// 把任务状态切换为「下载中」。
@@ -193,6 +223,8 @@ pub struct TaskBuilder {
     overwrite: bool,
     /// 网络请求超时时间。
     timeout: Option<Duration>,
+    /// 下载完成后对临时文件执行的完整性校验。
+    validator: Option<DownloadValidator>,
 }
 
 impl TaskBuilder {
@@ -207,6 +239,7 @@ impl TaskBuilder {
             filename: String::new(),
             overwrite: false,
             timeout: None,
+            validator: None,
         }
     }
 
@@ -273,6 +306,18 @@ impl TaskBuilder {
     /// 设置网络请求超时时间；`None` 表示不设置。
     pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// 设置下载完成后的完整性校验回调。
+    ///
+    /// 回调接收已完整写入并同步到磁盘的临时文件路径。返回 `Err` 时，任务会以
+    /// [`DownloadFailure::ValidationError`] 失败，临时文件随后会被清理。
+    pub fn validator<F>(mut self, validator: F) -> Self
+    where
+        F: Fn(PathBuf) -> Result<(), String> + Send + Sync + 'static,
+    {
+        self.validator = Some(Arc::new(validator));
         self
     }
 

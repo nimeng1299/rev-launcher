@@ -74,6 +74,8 @@ pub enum DownloadFailure {
     HttpStatusCode(ureq::http::StatusCode),
     /// 本地 IO 失败（创建目录、创建/读写文件等）。
     IOError(std::io::Error),
+    /// 下载完成后的完整性校验失败。
+    ValidationError(String),
     /// 未知原因。
     Unknown,
 }

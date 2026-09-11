@@ -105,7 +105,7 @@ impl Worker {
 ///
 /// 流程：发起 GET 请求 → 校验 HTTP 状态码 → 解析 `Content-Length` 更新总大小 →
 /// 创建保存目录与临时文件 → 边读边写、按读取间隔估算速度并更新进度 →
-/// `sync_all` 落盘 → 按需删除旧文件 → 把临时文件重命名为最终文件名。
+/// `sync_all` 落盘 → 校验临时文件 → 按需删除旧文件 → 把临时文件重命名为最终文件名。
 ///
 /// 任意一步失败都会通过 `Task::change_failure` 记录失败原因；
 /// 全部成功则通过 `Task::change_success` 标记任务完成。
@@ -197,14 +197,20 @@ fn download(task: Arc<Task>) {
 
     match file.sync_all() {
         Ok(_) => {
+            let temp_filename = task.path().join(task.temp_filename());
+            if let Some(validator) = task.validator() {
+                if let Err(reason) = validator(temp_filename.clone()) {
+                    task.change_failure(DownloadFailure::ValidationError(reason));
+                    let _  = std::fs::remove_file(temp_filename);
+                    return;
+                }
+            }
+
             if task.overwrite() {
                 let _ = std::fs::remove_file(&task.path().join(task.filename()));
             }
 
-            match std::fs::rename(
-                task.path().join(task.temp_filename()),
-                task.path().join(task.filename()),
-            ) {
+            match std::fs::rename(temp_filename, task.path().join(task.filename())) {
                 Ok(_) => {
                     task.change_success();
                 }

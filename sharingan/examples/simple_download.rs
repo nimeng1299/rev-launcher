@@ -64,16 +64,31 @@ fn main() {
             .path(std::env::current_dir().unwrap().join("test"))
             .filename("test10mb.bin".to_string())
             .overwrite(true)
+            .validator(|path|{
+                if std::fs::metadata(&path).map_err(|e|e.to_string())?.len() > u64::MAX {
+                    Ok(())
+                }else {
+                    Err(format!("download failed: {}", path.to_string_lossy()))
+                }
+            })
             .build()
     });
 
     for i in 0..task_num - 1 {
+        let min_len = 0;
         downloader.download(move |builder| {
             builder
                 .url("https://testfile.to/dl/1mb".to_string())
                 .path(std::env::current_dir().unwrap().join("test"))
                 .filename(format!("test{}.bin", i))
                 .overwrite(true)
+                .validator(move |path|{
+                    if std::fs::metadata(&path).map_err(|e|e.to_string())?.len() > min_len {
+                        Ok(())
+                    }else {
+                        Err(format!("download failed: {}", path.to_string_lossy()))
+                    }
+                })
                 .build()
         });
     }
