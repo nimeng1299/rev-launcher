@@ -30,6 +30,6 @@ pub enum GameWindowSize {
 
 impl Default for GameWindowSize {
     fn default() -> Self {
-        GameWindowSize::Windowed(860, 640)
+        GameWindowSize::Windowed(1024, 640)
     }
 }

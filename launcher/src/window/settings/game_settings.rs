@@ -8,12 +8,12 @@ use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::theme::ActiveTheme;
 use gpui_kit::{
     App, AppContext, Axis, Context, Entity, Hsla, IntoElement, ParentElement, SharedString, Styled,
-    Subscription, Window, div, hsla, prelude::FluentBuilder as _, px, relative,
+    Subscription, Task, Window, div, hsla, prelude::FluentBuilder as _, px, relative,
 };
 use mclib::java::java_version::JavaVersion;
 use mclib::settings::GameWindowSize;
 use std::time::Duration;
-use sysinfo::System;
+use sysinfo::{MemoryRefreshKind, System};
 
 use crate::data::settings::AppSettings;
 
@@ -25,14 +25,60 @@ fn max_memory_mb() -> usize {
 
     static MAX_MEMORY_MB: OnceLock<usize> = OnceLock::new();
     *MAX_MEMORY_MB.get_or_init(|| {
-        let total_mb = (System::new_all().total_memory() / 1024 / 1024) as usize;
+        let total_mb = (memory_system().total_memory() / 1024 / 1024) as usize;
         if total_mb > 0 { total_mb } else { 32 * 1024 }
     })
 }
 
-/// 当前系统已用内存（M）。每次都要重新采样，所以不走缓存。
-fn used_memory_mb() -> usize {
-    (System::new_all().used_memory() / 1024 / 1024) as usize
+/// 只读取物理内存，避免 new_all 扫描进程、CPU 等与此界面无关的信息。
+fn memory_system() -> System {
+    let mut system = System::new();
+    system.refresh_memory_specifics(MemoryRefreshKind::new().with_ram());
+    system
+}
+
+struct MemoryUsage {
+    used_mb: usize,
+    // 随 keyed state 释放，离开页面后取消轮询。
+    _task: Task<()>,
+}
+
+impl MemoryUsage {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // 首次只采样内存，让页面立即显示有效值；后续重绘直接读取缓存。
+        let mut system = memory_system();
+        let used_mb = (system.used_memory() / 1024 / 1024) as usize;
+        let task = cx.spawn_in(window, async move |view, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                // 复用 System，并把周期采样移到后台，避免阻塞 UI 线程。
+                system = cx
+                    .background_executor()
+                    .spawn(async move {
+                        system.refresh_memory_specifics(MemoryRefreshKind::new().with_ram());
+                        system
+                    })
+                    .await;
+                let used_mb = (system.used_memory() / 1024 / 1024) as usize;
+                if view
+                    .update_in(cx, |state, _, cx| {
+                        if state.used_mb != used_mb {
+                            state.used_mb = used_mb;
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        Self {
+            used_mb,
+            _task: task,
+        }
+    }
 }
 
 /// 把已选中的 Java 版本转换成下拉框的取值（存的是 java 可执行文件路径）。
@@ -253,24 +299,12 @@ pub fn global_game_settings_group<U: 'static>(cx: &mut Context<U>) -> SettingGro
                     }
                     let value = slider.read(cx).value().end() as usize;
 
-                    // 每 1 秒重新采样一次系统内存并重绘。放在 keyed state 里保证只起一个循环，
-                    // 重渲染不会重复开任务；窗口关掉后 update_in 失败，循环自己结束。
-                    window.use_keyed_state("memory-usage-tick", cx, move |window, cx| {
-                        cx.spawn_in(window, async move |view, cx| {
-                            loop {
-                                cx.background_executor().timer(Duration::from_secs(1)).await;
-                                let alive = view.update_in(cx, |_, _, cx| cx.notify()).is_ok();
-                                if !alive {
-                                    break;
-                                }
-                            }
-                        })
-                        .detach();
-                    });
+                    // 每秒在后台更新一次缓存；拖动滑块、悬停等重绘不会触发采样。
+                    let memory_usage = window.use_keyed_state("memory-usage", cx, MemoryUsage::new);
 
                     // 轨道分两段：深暖色是系统已用，浅暖色是本次打算分配的量；
                     // 右边只显示分配之后还剩多少可用内存。
-                    let used_mb = used_memory_mb();
+                    let used_mb = memory_usage.read(cx).used_mb;
                     let total_mb = max_memory_mb;
                     let remaining_mb = total_mb.saturating_sub(used_mb.saturating_add(value));
 

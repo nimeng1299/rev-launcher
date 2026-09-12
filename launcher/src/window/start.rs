@@ -5,15 +5,20 @@ use gpui_kit::component::label::Label;
 use gpui_kit::component::searchable_list::{SearchableListDelegate, SearchableListItem};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::tag::Tag;
-use gpui_kit::component::{Icon, IconName, IndexPath, Sizable, StyledExt, h_flex};
+use gpui_kit::component::{Icon, IconName, IndexPath, Sizable, StyledExt, WindowExt, h_flex};
 use gpui_kit::{
     AnyElement, App, AppContext, Context, Entity, IntoElement, ParentElement, Render, SharedString,
     Styled, Subscription, Window, div, px,
 };
 
+use mclib::launch::{LaunchInfo, Launcher};
 use mclib::project::game_project::{GameProject, ModLoader, find_all_game_in_project_folder};
 
+use crate::data::account_data::AccountData;
 use crate::data::settings::AppSettings;
+
+mod launch_dialog;
+use launch_dialog::LaunchDialog;
 
 /// 扫一遍设置里的所有版本目录，拿到全部项目。
 fn detect_projects(paths: &[PathBuf]) -> Vec<GameProject> {
@@ -194,6 +199,9 @@ pub struct StartPage {
     known_paths: Vec<PathBuf>,
     /// 上次同步时设置里的当前项目。
     known_selection: Option<PathBuf>,
+    /// 保留正在进行的启动任务，关闭弹窗后可以重新查看。
+    launch_dialog: Option<Entity<LaunchDialog>>,
+    _launch_subscription: Option<Subscription>,
 }
 
 impl StartPage {
@@ -254,7 +262,50 @@ impl StartPage {
             selected_project: selected.clone(),
             known_paths: paths,
             known_selection: selected,
+            launch_dialog: None,
+            _launch_subscription: None,
         }
+    }
+
+    fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        if let Some(dialog) = &self.launch_dialog
+            && dialog.read(cx).is_active()
+        {
+            LaunchDialog::open(dialog.clone(), window, cx);
+            return;
+        }
+
+        let project = self
+            .projects
+            .iter()
+            .find(|project| Some(&project.path) == self.selected_project.as_ref())
+            .cloned();
+        let title = project
+            .as_ref()
+            .map(|project| project.name.clone())
+            .unwrap_or_else(|| "启动游戏".into());
+        let account = cx.global::<AccountData>().get_default_account().cloned();
+        let launch = match (project, account) {
+            (None, _) => Err("请先选择要启动的项目；没有项目时，请在设置中添加版本目录。".into()),
+            (_, None) => Err("请先在设置中添加账号，并将要使用的账号设为默认账号。".into()),
+            (Some(project), Some(account)) => {
+                let settings = cx.global::<AppSettings>();
+                Ok(LaunchInfo::launch(Launcher::new(
+                    account,
+                    project,
+                    settings.java_versions.clone(),
+                    settings.global_settings.clone(),
+                )))
+            }
+        };
+        let dialog = cx.new(|cx| LaunchDialog::new(title, launch, window, cx));
+        self._launch_subscription = Some(cx.observe(&dialog, |_, _, cx| cx.notify()));
+        self.launch_dialog = Some(dialog.clone());
+        LaunchDialog::open(dialog, window, cx);
+        cx.notify();
     }
 
     /// 让下拉框跟上设置：设置页可能加过/删过版本目录，别的页面也可能改过当前项目。
@@ -310,6 +361,10 @@ impl StartPage {
 impl Render for StartPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_settings(window, cx);
+        let active = self
+            .launch_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.read(cx).is_active());
 
         div().v_flex().size_full().justify_end().child(
             div()
@@ -321,14 +376,16 @@ impl Render for StartPage {
                 .child(
                     div().h_flex().justify_end().child(
                         Button::new("launch")
-                            .label("启动游戏")
+                            .label(if active {
+                                "查看启动进度"
+                            } else {
+                                "启动游戏"
+                            })
                             .large()
                             .h(px(60.))
                             .px(px(40.))
                             .text_3xl()
-                            .on_click(|_, _, _| {
-                                println!("launch button clicked");
-                            }),
+                            .on_click(cx.listener(|this, _, window, cx| this.start(window, cx))),
                     ),
                 )
                 .child(

@@ -72,7 +72,7 @@ impl Worker {
         loop {
             if self.status.load(Ordering::SeqCst) == TaskStatus::Cancel {
                 if let Some(task) = self.ongoing_tasks.take() {
-                    task.change_downloading();
+                    task.change_failure(DownloadFailure::UserCancel);
 
                     let filename = task.path().join(task.temp_filename());
                     let _ = std::fs::remove_file(&filename);
@@ -92,6 +92,7 @@ impl Worker {
                 self.progressing_map.remove(&self.id);
             } else {
                 if let Some(new_task) = self.ready_map.pop() {
+                    new_task.change_downloading();
                     self.progressing_map.insert(self.id, new_task.clone());
                     self.ongoing_tasks = Some(new_task);
                 }
@@ -223,4 +224,110 @@ fn download(task: Arc<Task>) {
             task.change_failure(DownloadFailure::IOError(e));
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::downloader::DownloadBuilder;
+    use crate::status::DownloadStatus;
+    use crate::task::TaskBuilder;
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    #[test]
+    fn active_download_reports_downloading_until_body_completes() {
+        let directory = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/file", listener.local_addr().unwrap());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "等待本地下载请求超时");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = BufReader::new(&mut stream);
+            loop {
+                let mut line = String::new();
+                assert!(request.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            stream.write_all(b"test").unwrap();
+        });
+        let path = directory.path().to_path_buf();
+        let mut downloader = DownloadBuilder::new().thread_num(1).build();
+        downloader.download(move |builder| {
+            builder
+                .url(url.clone())
+                .path(path.clone())
+                .filename("file.bin".into())
+                .timeout(Some(Duration::from_secs(5)))
+                .build()
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            downloader.tasks()[&0].status(),
+            DownloadStatus::Downloading
+        ));
+        assert!(!downloader.is_finished());
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !downloader.is_finished() {
+            assert!(Instant::now() < deadline, "下载结束超时");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(downloader.is_all_success());
+        assert_eq!(downloader.tasks()[&0].progress().downloaded(), 4);
+        assert_eq!(downloader.tasks()[&0].progress().total(), Some(4));
+        assert_eq!(
+            std::fs::read(directory.path().join("file.bin")).unwrap(),
+            b"test"
+        );
+        downloader.cancel();
+    }
+
+    #[test]
+    fn cancelled_claimed_task_is_finished_instead_of_downloading() {
+        let directory = tempfile::tempdir().unwrap();
+        let task = Arc::new(
+            TaskBuilder::new(0)
+                .path(directory.path().to_path_buf())
+                .filename("cancelled.bin".into())
+                .build(),
+        );
+        task.change_downloading();
+        let mut worker = Worker::new(
+            0,
+            Arc::new(Atomic::new(TaskStatus::Cancel)),
+            Arc::new(Queue::default()),
+            Arc::new(Map::default()),
+            Arc::new(Map::default()),
+        );
+        worker.ongoing_tasks = Some(task.clone());
+        worker.run();
+        assert!(task.status().is_failed());
+        assert!(task.status().is_finished());
+    }
 }
