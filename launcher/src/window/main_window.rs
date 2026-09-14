@@ -3,6 +3,7 @@ use crate::window::develop::DevelopPage;
 use crate::window::download::DownloadPage;
 use crate::window::settings::SettingsPage;
 use crate::window::start::StartPage;
+use crate::window::vcs::VcsPage;
 use crate::window::version_control::{VersionControlEvent, VersionControlPage};
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{button::*, *};
@@ -17,8 +18,9 @@ enum MainPageTab {
     Start = 0,
     Download = 1,
     VersionControl = 2,
-    Develop = 3,
-    Settings = 4,
+    Vcs = 3,
+    Develop = 4,
+    Settings = 5,
 }
 
 impl MainPageTab {
@@ -27,8 +29,9 @@ impl MainPageTab {
             0 => MainPageTab::Start,
             1 => MainPageTab::Download,
             2 => MainPageTab::VersionControl,
-            3 => MainPageTab::Develop,
-            4 => MainPageTab::Settings,
+            3 => MainPageTab::Vcs,
+            4 => MainPageTab::Develop,
+            5 => MainPageTab::Settings,
             _ => MainPageTab::Start,
         }
     }
@@ -39,6 +42,7 @@ pub struct MainWindow {
     start_page: Option<Entity<StartPage>>,
     download_page: Option<Entity<DownloadPage>>,
     version_control_page: Option<Entity<VersionControlPage>>,
+    vcs_page: Option<Entity<VcsPage>>,
     develop_page: Option<Entity<DevelopPage>>,
     settings_page: Option<Entity<SettingsPage>>,
 }
@@ -87,6 +91,10 @@ impl Render for MainWindow {
 
                 page
             })
+            .clone();
+        let vcs_page = self
+            .vcs_page
+            .get_or_insert_with(|| cx.new(|cx| VcsPage::new(window, cx)))
             .clone();
         let develop_page = self
             .develop_page
@@ -161,6 +169,7 @@ impl Render for MainWindow {
                             .child(Tab::new().label("启动"))
                             .child(Tab::new().label("下载"))
                             .child(Tab::new().label("版本管理"))
+                            .child(Tab::new().label("VCS"))
                             .child(Tab::new().label("开发"))
                             .child(Tab::new().label("设置")),
                     )
@@ -168,6 +177,7 @@ impl Render for MainWindow {
                         MainPageTab::Start => start_page.into_any_element(),
                         MainPageTab::Download => download_page.into_any_element(),
                         MainPageTab::VersionControl => version_control_page.into_any_element(),
+                        MainPageTab::Vcs => vcs_page.into_any_element(),
                         MainPageTab::Develop => develop_page.into_any_element(),
                         MainPageTab::Settings => settings_page.into_any_element(),
                     })),
@@ -188,6 +198,7 @@ impl Default for MainWindow {
             start_page: None,
             download_page: None,
             version_control_page: None,
+            vcs_page: None,
             develop_page: None,
             settings_page: None,
         }

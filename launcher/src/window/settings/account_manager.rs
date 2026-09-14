@@ -1,5 +1,4 @@
 use crate::data::account_data::AccountData;
-use crate::data::settings::AppSettings;
 use gpui_kit::base::{IndexPath, h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants};
 use gpui_kit::component::form::{field, v_form};

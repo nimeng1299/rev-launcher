@@ -12,6 +12,7 @@ mclib = { path = "mclib" }
 sharingan = {path = "sharingan"}
 
 anyhow = "1.0"
+futures = "0.3"
 atomig = "0.4.3"
 atomic_float = "1"
 hex = "0.4.3"
@@ -24,3 +25,4 @@ sha1 = "0.11.0"
 smart-default = "0.7.1"
 ureq = "3"
 uuid = "1"
+pollster = "1.0.1"

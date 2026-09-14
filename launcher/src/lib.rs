@@ -6,6 +6,7 @@ use gpui_kit::component::{Root, Theme, ThemeMode, TitleBar};
 use gpui_kit::{AppContext, Bounds, Point, Size, WindowBounds, px};
 
 pub mod data;
+pub mod jj;
 pub mod window;
 
 pub fn run_app() {

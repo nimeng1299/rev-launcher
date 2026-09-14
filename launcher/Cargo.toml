@@ -7,11 +7,15 @@ edition.workspace = true
 mclib = {workspace = true}
 sharingan = {workspace = true}
 anyhow = {workspace = true}
+futures = {workspace = true}
+pollster = {workspace = true}
 serde = {workspace = true, features = ["derive"] }
 serde_json = {workspace = true}
 smart-default = {workspace = true}
 
 dirs = "7"
+chrono = "0.4"
+jj-lib = "0.45.1"
 gpui-kit = "0.6"
 rfd = "0.17.2"
 sysinfo = "0.31.4"
