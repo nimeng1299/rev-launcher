@@ -75,6 +75,8 @@ const GRAPH_NODE_CENTER_Y: f32 = 15.;
 const GRAPH_SIDE_EDGE_Y: f32 = 33.;
 const GRAPH_LANE_WIDTH: f32 = 16.;
 const GRAPH_LEFT_PADDING: f32 = 10.;
+const GRAPH_LINE_WIDTH: f32 = 2.;
+const GRAPH_CORNER_RADIUS: f32 = 1.;
 
 fn graph_element(
     row: &GraphRow,
@@ -101,7 +103,7 @@ fn graph_element(
                     .absolute()
                     .left(px(x))
                     .top_0()
-                    .w(px(2.))
+                    .w(px(GRAPH_LINE_WIDTH))
                     .h(px(center_y))
                     .bg(line_color),
             );
@@ -112,7 +114,7 @@ fn graph_element(
                     .absolute()
                     .left(px(x))
                     .top(px(center_y))
-                    .w(px(2.))
+                    .w(px(GRAPH_LINE_WIDTH))
                     .h(px(GRAPH_ROW_HEIGHT - center_y))
                     .bg(line_color),
             );
@@ -140,7 +142,8 @@ fn graph_element(
                             .left(px(left))
                             .top(px(edge_y - 1.))
                             .w(px((node_x - parent_x).abs() + 2.))
-                            .h(px(2.))
+                            .h(px(GRAPH_LINE_WIDTH))
+                            .rounded(px(GRAPH_CORNER_RADIUS))
                             .bg(line_color),
                     )
                     .child(
@@ -148,8 +151,9 @@ fn graph_element(
                             .absolute()
                             .left(px(node_x))
                             .top(px(center_y))
-                            .w(px(2.))
+                            .w(px(GRAPH_LINE_WIDTH))
                             .h(px(edge_y - center_y + 1.))
+                            .rounded(px(GRAPH_CORNER_RADIUS))
                             .bg(line_color),
                     );
             } else {
@@ -159,7 +163,7 @@ fn graph_element(
                         .left(px(left))
                         .top(px(center_y - 1.))
                         .w(px((node_x - parent_x).abs() + 2.))
-                        .h(px(2.))
+                        .h(px(GRAPH_LINE_WIDTH))
                         .bg(line_color),
                 );
             }

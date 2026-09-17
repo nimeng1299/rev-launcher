@@ -146,6 +146,23 @@ pub fn load_history<P: AsRef<Path>>(path: P, revset_str: &str) -> anyhow::Result
     })
     .context("failed to read repository history")?;
 
+    // Keep each fork together before rendering it. This is the same grouping
+    // strategy used by jj's graph output and prevents independent lanes from
+    // weaving across each other as they converge.
+    let graph_nodes = futures::executor::block_on(async {
+        let stream = jj_lib::graph::TopoGroupedGraph::new(
+            futures::stream::iter(graph_nodes.into_iter().map(Ok::<_, anyhow::Error>)),
+            |id: &CommitId| id,
+        )
+        .stream();
+        futures::pin_mut!(stream);
+        let mut nodes = Vec::new();
+        while let Some(node) = futures::StreamExt::next(&mut stream).await {
+            nodes.push(node?);
+        }
+        Ok::<_, anyhow::Error>(nodes)
+    })?;
+
     let mut bookmarks_by_commit: HashMap<String, Vec<Bookmark>> = HashMap::new();
     for (name, target) in repo.view().local_bookmarks() {
         for commit_id in target.added_ids() {
