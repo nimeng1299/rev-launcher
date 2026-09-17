@@ -1,10 +1,9 @@
-use std::path::PathBuf;
-
 use gpui_kit::component::button::Button;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListItem, ListState};
 use gpui_kit::component::notification::NotificationType;
+use gpui_kit::component::select::{Select, SelectEvent};
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{ActiveTheme, IndexPath, StyledExt, WindowExt, h_flex};
 use gpui_kit::{
@@ -12,8 +11,8 @@ use gpui_kit::{
     Render, SharedString, Styled, Subscription, WeakEntity, Window, div, hsla, px,
 };
 
-use crate::data::settings::AppSettings;
 use crate::jj;
+use crate::window::project_select::{ProjectList, ProjectSelect};
 
 #[derive(Debug, Clone)]
 struct GraphRow {
@@ -458,7 +457,10 @@ impl ListDelegate for CommitListDelegate {
 
 pub struct VcsPage {
     commit_state: Entity<ListState<CommitListDelegate>>,
-    selected_project: Option<PathBuf>,
+    /// 项目下拉框，和启动页共用一份实现；选中项写回设置，两个页面自然同步。
+    project_select: ProjectSelect,
+    /// 保活项目下拉框的事件订阅。
+    _select_subscription: Subscription,
     revset: String,
     revset_input: Entity<InputState>,
     _revset_subscription: Subscription,
@@ -468,7 +470,25 @@ pub struct VcsPage {
 
 impl VcsPage {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let selected_project = cx.global::<AppSettings>().select_project_path.clone();
+        let project_select = ProjectSelect::new(window, cx);
+        let select_subscription = cx.subscribe_in(
+            project_select.state(),
+            window,
+            |page: &mut Self, _state, event: &SelectEvent<ProjectList>, window, cx| {
+                let SelectEvent::Confirm(Some(path)) = event else {
+                    return;
+                };
+
+                // 写回设置由下拉框自己负责，启动页下次渲染就会跟上。
+                if !page.project_select.confirm(path.clone(), cx) {
+                    return;
+                }
+
+                page.reload_history(window, cx);
+                cx.notify();
+            },
+        );
+
         let revset = jj::DEFAULT_REVSET.to_owned();
         let revset_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -491,7 +511,8 @@ impl VcsPage {
 
         let mut page = Self {
             commit_state,
-            selected_project,
+            project_select,
+            _select_subscription: select_subscription,
             revset,
             revset_input,
             _revset_subscription: revset_subscription,
@@ -505,7 +526,7 @@ impl VcsPage {
     fn reload_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.history_request_id = self.history_request_id.wrapping_add(1);
         let request_id = self.history_request_id;
-        let selected_project = self.selected_project.clone();
+        let selected_project = self.project_select.selected_path().cloned();
         let revset = self.revset.clone();
         let Some(path) = selected_project else {
             self.commit_state.update(cx, |state, cx| {
@@ -539,10 +560,11 @@ impl VcsPage {
         .detach();
     }
 
+    /// 让下拉框跟上设置：设置页/启动页可能换过当前项目，也可能增删过版本目录。
+    ///
+    /// 选中的项目变了才重新读历史，只是选项列表变了不用重读。
     fn sync_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let selected_project = cx.global::<AppSettings>().select_project_path.clone();
-        if selected_project != self.selected_project {
-            self.selected_project = selected_project;
+        if self.project_select.sync(window, cx) {
             self.reload_history(window, cx);
         }
     }
@@ -552,7 +574,7 @@ impl VcsPage {
             return;
         }
 
-        let Some(path) = self.selected_project.clone() else {
+        let Some(path) = self.project_select.selected_path().cloned() else {
             window.push_notification(
                 (NotificationType::Error, "当前没有选中的整合包".to_owned()),
                 cx,
@@ -627,11 +649,6 @@ impl VcsPage {
 impl Render for VcsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_selection(window, cx);
-        let selected_project = self
-            .selected_project
-            .as_ref()
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|| "未选择整合包".to_owned());
 
         div()
             .v_flex()
@@ -645,19 +662,19 @@ impl Render for VcsPage {
                     .gap_2()
                     .child(Label::new("VCS"))
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .child(Label::new(selected_project)),
+                        div().flex_1().min_w_0().child(
+                            Select::new(self.project_select.state())
+                                .h(px(32.))
+                                .placeholder("选择要查看的整合包"),
+                        ),
                     )
                     .child(
                         Button::new("refresh-vcs")
                             .icon(gpui_kit::component::IconName::RotateCw)
                             .label("刷新")
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.selected_project =
-                                    cx.global::<AppSettings>().select_project_path.clone();
+                                // 先把下拉框和设置对齐，再按当前项目重读历史。
+                                this.project_select.sync(window, cx);
                                 this.reload_history(window, cx);
                             })),
                     ),
