@@ -18,6 +18,7 @@ use jj_lib::ui_path::RepoPathUiConverter;
 use jj_lib::workspace::Workspace;
 use pollster::FutureExt as _;
 
+pub mod user_config;
 pub mod user_settings;
 
 pub const DEFAULT_REVSET: &str = "present(@) | ancestors(immutable_heads().., 2) | trunk()";
