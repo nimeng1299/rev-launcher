@@ -1,5 +1,5 @@
 use crate::project::game_project_error::GameProjectError;
-use crate::project::project_json_file::{json_get_libraries, json_get_patches};
+use crate::project::project_json_file::json_get_patches;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, from_str};
 use std::path::PathBuf;
