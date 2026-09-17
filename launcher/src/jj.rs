@@ -7,6 +7,7 @@ use jj_lib::default_backend_factories::{
     default_backend_factories, default_working_copy_factories,
 };
 use jj_lib::fileset::FilesetAliasesMap;
+use jj_lib::op_store::RefTarget;
 use jj_lib::repo::Repo as _;
 use jj_lib::revset::{
     RevsetAliasesMap, RevsetDiagnostics, RevsetExtensions, RevsetParseContext,
@@ -29,6 +30,19 @@ pub struct CommitHistoryItem {
     pub author: String,
     pub timestamp: String,
     pub parents: Vec<String>,
+    pub bookmarks: Vec<Bookmark>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bookmark {
+    pub name: String,
+    pub kind: BookmarkKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BookmarkKind {
+    Local,
+    Remote(String),
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +146,30 @@ pub fn load_history<P: AsRef<Path>>(path: P, revset_str: &str) -> anyhow::Result
     })
     .context("failed to read repository history")?;
 
+    let mut bookmarks_by_commit: HashMap<String, Vec<Bookmark>> = HashMap::new();
+    for (name, target) in repo.view().local_bookmarks() {
+        for commit_id in target.added_ids() {
+            bookmarks_by_commit
+                .entry(commit_id.to_string())
+                .or_default()
+                .push(Bookmark {
+                    name: name.as_str().to_owned(),
+                    kind: BookmarkKind::Local,
+                });
+        }
+    }
+    for (symbol, remote_ref) in repo.view().all_remote_bookmarks() {
+        for commit_id in remote_ref.target.added_ids() {
+            bookmarks_by_commit
+                .entry(commit_id.to_string())
+                .or_default()
+                .push(Bookmark {
+                    name: symbol.name.as_str().to_owned(),
+                    kind: BookmarkKind::Remote(symbol.remote.as_str().to_owned()),
+                });
+        }
+    }
+
     let commits = graph_nodes
         .into_iter()
         .map(|(commit_id, _edges)| {
@@ -159,6 +197,9 @@ pub fn load_history<P: AsRef<Path>>(path: P, revset_str: &str) -> anyhow::Result
                     .iter()
                     .map(ToString::to_string)
                     .collect(),
+                bookmarks: bookmarks_by_commit
+                    .remove(&commit.id().to_string())
+                    .unwrap_or_default(),
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -199,6 +240,36 @@ pub fn checkout<P: AsRef<Path>>(path: P, commit_id: &str) -> anyhow::Result<()> 
         .check_out(repo.op_id().clone(), None, &commit)
         .block_on()
         .context("failed to update working copy")?;
+    Ok(())
+}
+
+pub fn move_local_bookmark<P: AsRef<Path>>(
+    path: P,
+    bookmark_name: &str,
+    commit_id: &str,
+) -> anyhow::Result<()> {
+    let workspace = load_workspace(path.as_ref())?;
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .block_on()
+        .context("failed to load repository")?;
+    let commit_id = CommitId::try_from_hex(commit_id.as_bytes())
+        .ok_or_else(|| anyhow!("invalid commit id: {commit_id}"))?;
+    let commit = repo
+        .store()
+        .get_commit(&commit_id)
+        .context("commit does not exist")?;
+
+    let mut transaction = repo.start_transaction();
+    transaction.repo_mut().set_local_bookmark_target(
+        jj_lib::ref_name::RefName::new(bookmark_name),
+        RefTarget::normal(commit.id().clone()),
+    );
+    transaction
+        .commit(format!("move bookmark {bookmark_name} to {commit_id}"))
+        .block_on()
+        .context("failed to save bookmark")?;
     Ok(())
 }
 

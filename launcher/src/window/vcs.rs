@@ -7,8 +7,9 @@ use gpui_kit::component::select::{Select, SelectEvent};
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{ActiveTheme, IndexPath, StyledExt, WindowExt, h_flex};
 use gpui_kit::{
-    AnyElement, App, AppContext, ClickEvent, Context, Entity, Hsla, IntoElement, ParentElement,
-    Render, SharedString, Styled, Subscription, WeakEntity, Window, div, hsla, px,
+    AnyElement, App, AppContext, ClickEvent, Context, Entity, Hsla, InteractiveElement,
+    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, WeakEntity, Window, div, hsla, px,
 };
 
 use crate::jj;
@@ -227,11 +228,80 @@ fn colored_id(
 }
 
 fn change_id_color() -> Hsla {
-    hsla(330.0, 0.82, 0.68, 1.0)
+    hsla(330.0 / 360.0, 0.82, 0.68, 1.0)
 }
 
 fn commit_id_color() -> Hsla {
-    hsla(270.0, 0.72, 0.70, 1.0)
+    hsla(270.0 / 360.0, 0.72, 0.70, 1.0)
+}
+
+fn local_bookmark_color() -> Hsla {
+    hsla(210.0 / 360.0, 0.85, 0.68, 1.0)
+}
+
+fn remote_bookmark_color() -> Hsla {
+    hsla(30.0 / 360.0, 0.90, 0.68, 1.0)
+}
+
+#[derive(Clone)]
+struct LocalBookmarkDrag {
+    name: String,
+}
+
+struct BookmarkDragPreview {
+    name: String,
+}
+
+impl Render for BookmarkDragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded(px(4.))
+            .bg(local_bookmark_color().opacity(0.2))
+            .child(Label::new(self.name.clone()).text_color(local_bookmark_color()))
+    }
+}
+
+fn bookmark_element(bookmark: &jj::Bookmark, disabled: bool) -> AnyElement {
+    let (display_name, color, is_local) = match &bookmark.kind {
+        jj::BookmarkKind::Local => (bookmark.name.clone(), local_bookmark_color(), true),
+        jj::BookmarkKind::Remote(remote) => (
+            format!("{}@{}", bookmark.name, remote),
+            remote_bookmark_color(),
+            false,
+        ),
+    };
+
+    let element = div()
+        .flex_none()
+        .items_center()
+        .gap_1()
+        .px_1()
+        .py_0()
+        .rounded(px(4.))
+        .border_1()
+        .border_color(color.opacity(0.55))
+        .bg(color.opacity(0.18))
+        .text_sm()
+        .text_color(color)
+        .child(Label::new(display_name).text_color(color));
+    if is_local && !disabled {
+        return element
+            .id(format!("bookmark-drag-{}", bookmark.name))
+            .on_drag(
+                LocalBookmarkDrag {
+                    name: bookmark.name.clone(),
+                },
+                |drag, _, _, cx| {
+                    cx.new(|_| BookmarkDragPreview {
+                        name: drag.name.clone(),
+                    })
+                },
+            )
+            .into_any_element();
+    }
+    element.into_any_element()
 }
 
 struct CommitListDelegate {
@@ -348,6 +418,23 @@ impl ListDelegate for CommitListDelegate {
         let short_commit_id = format!("{:.8}", commit.id);
         let commit_id_prefix_length = self.commit_id_prefixes.get(ix.row).copied().unwrap_or(0);
         let disabled = self.disabled;
+        let drop_page = self.page.clone();
+        let drop_commit_id = commit.id.clone();
+        let mut bookmark_elements = h_flex().flex_none().gap_1();
+        for bookmark in &commit.bookmarks {
+            bookmark_elements = bookmark_elements.child(bookmark_element(bookmark, disabled));
+        }
+        let description_line = h_flex()
+            .min_w_0()
+            .gap_1()
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .truncate()
+                    .child(Label::new(commit.description.clone())),
+            )
+            .child(bookmark_elements);
 
         let mut meta = h_flex()
             .items_center()
@@ -391,12 +478,7 @@ impl ListDelegate for CommitListDelegate {
                                 .min_w_0()
                                 .flex_1()
                                 .gap_1()
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .truncate()
-                                        .child(Label::new(commit.description.clone())),
-                                )
+                                .child(description_line)
                                 .child(meta),
                         )
                         .child(colored_id(
@@ -405,6 +487,24 @@ impl ListDelegate for CommitListDelegate {
                             commit_id_color(),
                             normal_id_color,
                         )),
+                )
+                .drag_over::<LocalBookmarkDrag>(|style, _, _, _| {
+                    style.bg(local_bookmark_color().opacity(0.12))
+                })
+                .on_drop(
+                    cx.listener(move |_, drag: &LocalBookmarkDrag, window, _cx| {
+                        if disabled {
+                            return;
+                        }
+                        let page = drop_page.clone();
+                        let bookmark_name = drag.name.clone();
+                        let commit_id = drop_commit_id.clone();
+                        window.on_next_frame(move |window, cx| {
+                            let _ = page.update(cx, |page, cx| {
+                                page.move_bookmark(bookmark_name, commit_id, window, cx);
+                            });
+                        });
+                    }),
                 )
                 .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                     if disabled {
@@ -644,6 +744,84 @@ impl VcsPage {
         })
         .detach();
     }
+
+    fn move_bookmark(
+        &mut self,
+        bookmark_name: String,
+        commit_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.checkout_in_progress {
+            return;
+        }
+
+        let Some(path) = self.project_select.selected_path().cloned() else {
+            window.push_notification(
+                (NotificationType::Error, "当前没有选中的整合包".to_owned()),
+                cx,
+            );
+            return;
+        };
+
+        self.checkout_in_progress = true;
+        self.history_request_id = self.history_request_id.wrapping_add(1);
+        let request_id = self.history_request_id;
+        self.commit_state.update(cx, |state, cx| {
+            state.delegate_mut().set_disabled(true);
+            cx.notify();
+        });
+
+        let revset = self.revset.clone();
+        let notification_bookmark = bookmark_name.clone();
+        let notification_commit_id = commit_id.clone();
+        let page = cx.entity().downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    jj::move_local_bookmark(&path, &bookmark_name, &commit_id)
+                        .map_err(|error| format!("移动 bookmark 失败：{error}"))?;
+                    jj::load_history(&path, &revset)
+                        .map_err(|error| format!("读取提交历史失败：{error}"))
+                })
+                .await;
+
+            let _ = page.update_in(cx, |page, window, cx| {
+                page.checkout_in_progress = false;
+                page.commit_state.update(cx, |state, cx| {
+                    state.delegate_mut().set_disabled(false);
+                    cx.notify();
+                });
+                if page.history_request_id != request_id {
+                    return;
+                }
+
+                match result {
+                    Ok(history) => {
+                        page.commit_state.update(cx, |state, cx| {
+                            state.delegate_mut().set_history_result(Ok(history));
+                            cx.notify();
+                        });
+                        window.push_notification(
+                            (
+                                NotificationType::Success,
+                                format!(
+                                    "已将 bookmark {} 移动到提交 {:.8}",
+                                    notification_bookmark, notification_commit_id
+                                ),
+                            ),
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        window.push_notification((NotificationType::Error, error), cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
 }
 
 impl Render for VcsPage {
@@ -715,6 +893,7 @@ mod tests {
             author: String::new(),
             timestamp: String::new(),
             parents: parents.iter().map(|parent| (*parent).to_owned()).collect(),
+            bookmarks: Vec::new(),
         }
     }
 
