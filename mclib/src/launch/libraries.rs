@@ -559,15 +559,13 @@ mod tests {
                 .exists()
         );
         let command = data.launch_command().unwrap();
-        assert!(
-            command.arguments.contains(&format!(
+        assert!(command.arguments.contains(&format!(
                 "-Dlog4j.configurationFile={}",
                 data.setting
                     .libraries_path
                     .join(logging_cache_path("client-1.12.xml").unwrap())
                     .display()
-            ))
-        );
+            )));
         assert!(
             command
                 .arguments

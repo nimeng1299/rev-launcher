@@ -112,16 +112,7 @@ impl Render for SettingsPage {
                                     ),
                                 ),
                             ))
-                            .group(SettingGroup::new().title("Basic Options").item(
-                                SettingItem::new(
-                                    "Enable Feature",
-                                    SettingField::dropdown(
-                                        options.clone(),
-                                        |_cx| SharedString::from("aaa"),
-                                        |_value, _cx| {},
-                                    ),
-                                ),
-                            )),
+                            .group(SettingGroup::new().title("jj - Jujutsu")),
                         SettingPage::new("项目管理").group(SettingGroup::new().item(
                             SettingItem::render(move |_options, _window, _app| {
                                 project_manager_page.clone().into_any_element()

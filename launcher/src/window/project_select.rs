@@ -61,7 +61,8 @@ fn index_of(projects: &[GameProject], path: Option<&PathBuf>) -> Option<IndexPat
         .map(IndexPath::new)
 }
 
-fn loader_name(loader: &ModLoader) -> &'static str {
+/// 加载器的展示名字，下拉框和项目信息卡片共用。
+pub fn loader_name(loader: &ModLoader) -> &'static str {
     match loader {
         ModLoader::Minecraft => "原版",
         ModLoader::Forge => "Forge",
@@ -379,7 +380,10 @@ mod tests {
     fn index_of_matches_the_project_path() {
         let projects = vec![project("a", "/a"), project("b", "/b")];
 
-        assert_eq!(index_of(&projects, Some(&PathBuf::from("/b"))), Some(IndexPath::new(1)));
+        assert_eq!(
+            index_of(&projects, Some(&PathBuf::from("/b"))),
+            Some(IndexPath::new(1))
+        );
         assert_eq!(index_of(&projects, Some(&PathBuf::from("/gone"))), None);
         assert_eq!(index_of(&projects, None), None);
     }

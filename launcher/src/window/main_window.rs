@@ -185,7 +185,7 @@ impl Render for MainWindow {
             // 通知层画在对话框层之上，而通知本身是 occlude 的（会吞掉鼠标事件）。
             // 所以只要对话框打开时弹通知，通知就可能盖住对话框右上角的关闭按钮，
             // 让对话框关不掉（鼠标悬在通知上还会暂停它的自动消失）。
-            // 对话框内的反馈请直接画在对话框里，不要用 push_notification。
+            // 对话框内的反馈直接画在对话框里，不要用 push_notification。
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_notification_layer(window, cx))
     }
