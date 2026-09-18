@@ -148,6 +148,16 @@ pub struct FileInfo {
     pub sync_at: String,
 }
 
+impl FileInfo {
+    /// 返回文件的 sha1 哈希（CurseForge hashes 中 algo = 1 的条目）。
+    pub fn sha1(&self) -> Option<&str> {
+        self.hashes
+            .iter()
+            .find(|h| h.algo == 1)
+            .map(|h| h.value.as_str())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 子结构
 // ---------------------------------------------------------------------------
