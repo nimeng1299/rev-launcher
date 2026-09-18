@@ -3,7 +3,9 @@ pub mod curse_finger_print;
 use std::io::Read;
 use std::path::Path;
 use serde::Serialize;
-use crate::detective::curseforge::curse_finger_print::{parse_fingerprint_response, FingerprintMatches};
+use crate::detective::curseforge::curse_finger_print::{
+    parse_file_info_response, parse_fingerprint_response, FileInfo, FingerprintMatches,
+};
 
 #[derive(Serialize)]
 struct Payload {
@@ -76,6 +78,10 @@ pub fn fingerprint<P: AsRef<Path>>(path: P) -> Result<u32, std::io::Error> {
     Ok(fingerprint_bytes(&buf))
 }
 
+/// 批量查询文件的 CurseForge 指纹匹配信息。
+///
+/// 每次请求最多携带 [`super::QUERY_BATCH_SIZE`] 个指纹，超出时自动分批，
+/// 最后把各批结果合并返回。
 pub fn find_curse_info<P: AsRef<Path>>(
     paths: Vec<P>,
     ua: &str,
@@ -94,22 +100,40 @@ pub fn find_curse_info<P: AsRef<Path>>(
         }
     }
 
-    let payload = Payload {
-        fingerprints: fingers,
-    };
+    let mut merged = FingerprintMatches::default();
 
-    let mut resp = agent
-        .post("https://mod.mcimirror.top/curseforge/v1/fingerprints")
-        .header("accept", "application/json")
-        .header("Content-Type", "application/json")
-        .send_json(&payload)?;
+    for batch in fingers.chunks(super::QUERY_BATCH_SIZE) {
+        let payload = Payload {
+            fingerprints: batch.to_vec(),
+        };
 
-    if !resp.status().is_success() {
-        return Err(ureq::Error::StatusCode(resp.status().as_u16()).into());
+        let mut resp = agent
+            .post("https://mod.mcimirror.top/curseforge/v1/fingerprints")
+            .header("accept", "application/json")
+            .header("Content-Type", "application/json")
+            .send_json(&payload)?;
+
+        if !resp.status().is_success() {
+            return Err(ureq::Error::StatusCode(resp.status().as_u16()).into());
+        }
+
+        let body = resp.body_mut().read_to_string()?;
+        let matches = parse_fingerprint_response(&body)?;
+
+        merged.exact_fingerprints.extend(matches.exact_fingerprints);
+        merged.exact_matches.extend(matches.exact_matches);
+        merged.installed_fingerprints.extend(matches.installed_fingerprints);
+        merged.is_cache_built |= matches.is_cache_built;
+        merged
+            .partial_match_fingerprints
+            .extend(matches.partial_match_fingerprints);
+        merged.partial_matches.extend(matches.partial_matches);
+        merged
+            .unmatched_fingerprints
+            .extend(matches.unmatched_fingerprints);
     }
 
-    let body = resp.body_mut().read_to_string()?;
-    parse_fingerprint_response(&body)
+    Ok(merged)
 }
 
 /// 使用启动器的ua来获取信息
@@ -119,4 +143,41 @@ pub fn find_curse_info_with_rev_ua<P: AsRef<Path>>(
     paths: Vec<P>,
 ) -> Result<FingerprintMatches, crate::error::Error> {
     find_curse_info(paths, "RevLauncher/0.1")
+}
+
+/// 通过 mod id（project id）和 file id 获取文件信息
+/// 接口：GET /curseforge/v1/mods/{mod_id}/files/{file_id}
+pub fn find_curse_file_info(
+    mod_id: i64,
+    file_id: i64,
+    ua: &str,
+) -> Result<FileInfo, crate::error::Error> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(30)))
+        .user_agent(ua)
+        .build()
+        .new_agent();
+
+    let mut resp = agent
+        .get(format!(
+            "https://mod.mcimirror.top/curseforge/v1/mods/{mod_id}/files/{file_id}"
+        ))
+        .header("accept", "application/json")
+        .call()?;
+
+    if !resp.status().is_success() {
+        return Err(ureq::Error::StatusCode(resp.status().as_u16()).into());
+    }
+
+    let body = resp.body_mut().read_to_string()?;
+    parse_file_info_response(&body)
+}
+
+/// 使用启动器的ua通过 id 获取文件信息
+/// 目前使用的ua: "RevLauncher/0.1"
+pub fn find_curse_file_info_with_rev_ua(
+    mod_id: i64,
+    file_id: i64,
+) -> Result<FileInfo, crate::error::Error> {
+    find_curse_file_info(mod_id, file_id, "RevLauncher/0.1")
 }

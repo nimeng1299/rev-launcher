@@ -19,6 +19,9 @@ pub enum Error {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("TOML error: {0}")]
+    Toml(#[from] toml_edit::ser::Error),
+
     #[error("Deserialize failed，Paht: `{path}`，error: {message}")]
     Deserialize { path: String, message: String },
 

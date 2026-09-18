@@ -2,20 +2,20 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModInfo{
-    filename: String,
+    pub filename: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    curseforge: Option<CurseforgeInfo>,
+    pub curseforge: Option<CurseforgeInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    modrinth: Option<ModrinthInfo>,
+    pub modrinth: Option<ModrinthInfo>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CurseforgeInfo{
-    project_id: i64,
-    file_id: i64
+    pub project_id: i64,
+    pub file_id: i64
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModrinthInfo{
-    id: String
+    pub id: String
 }

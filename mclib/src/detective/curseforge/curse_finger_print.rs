@@ -21,8 +21,13 @@ struct Envelope {
     pub data: FingerprintMatches,
 }
 
-#[serde_as]
 #[derive(Debug, Clone, Deserialize)]
+struct FileInfoEnvelope {
+    pub data: FileInfo,
+}
+
+#[serde_as]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FingerprintMatches {
     #[serde(default)]
@@ -270,5 +275,63 @@ pub fn parse_fingerprint_response(
                 message: e.into_inner().to_string(),
             }),
         }
+    }
+}
+
+/// 解析 CurseForge 文件信息响应（GET /mods/{modId}/files/{fileId}）。
+///
+/// 兼容两种情况:
+///  - 顶层为 `{ "data": {...} }`(走 `FileInfoEnvelope`)
+///  - 顶层直接就是文件对象(走 `FileInfo`)
+pub fn parse_file_info_response(body: &str) -> Result<FileInfo, crate::error::Error> {
+    let value: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(crate::error::Error::Deserialize {
+                path: "<root>".to_string(),
+                message: e.to_string(),
+            });
+        }
+    };
+
+    let result = if value.get("data").is_some() {
+        let mut de = serde_json::Deserializer::from_str(body);
+        serde_path_to_error::deserialize::<_, FileInfoEnvelope>(&mut de)
+            .map(|envelope| envelope.data)
+    } else {
+        let mut de = serde_json::Deserializer::from_str(body);
+        serde_path_to_error::deserialize::<_, FileInfo>(&mut de)
+    };
+
+    result.map_err(|e| crate::error::Error::Deserialize {
+        path: e.path().to_string(),
+        message: e.into_inner().to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_file_info_response;
+
+    /// 截取自 GET /curseforge/v1/mods/394468/files/5485657 的真实响应
+    #[test]
+    fn parse_file_info_test() {
+        let body = r#"{"data":{"id":5485657,"gameId":432,"modId":394468,"isAvailable":true,"displayName":"Sodium 0.5.11","fileName":"sodium-fabric-0.5.11+mc1.21.jar","releaseType":1,"fileDate":"2024-06-29T14:32:16.563Z","fileLength":982671,"downloadUrl":"https://edge.forgecdn.net/files/5485/657/sodium-fabric-0.5.11%2bmc1.21.jar","gameVersions":["1.21","Fabric","Client"],"fileSizeOnDisk":null}}"#;
+
+        let info = parse_file_info_response(body).unwrap();
+        assert_eq!(info.id, 5485657);
+        assert_eq!(info.mod_id, 394468);
+        assert_eq!(info.display_name, "Sodium 0.5.11");
+        assert_eq!(info.file_length, 982671);
+        assert!(info.download_url.contains("edge.forgecdn.net"));
+    }
+
+    #[test]
+    fn parse_file_info_without_data_wrapper_test() {
+        let body = r#"{"id":1,"modId":2,"fileName":"a.jar"}"#;
+        let info = parse_file_info_response(body).unwrap();
+        assert_eq!(info.id, 1);
+        assert_eq!(info.mod_id, 2);
+        assert_eq!(info.file_name, "a.jar");
     }
 }

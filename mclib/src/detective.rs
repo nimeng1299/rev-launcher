@@ -6,3 +6,6 @@ pub mod curseforge;
 pub mod modrinth;
 pub mod base;
 pub mod mod_info;
+
+/// 单次批量查询请求携带的最大文件数，防止一次请求过大导致超时
+pub(crate) const QUERY_BATCH_SIZE: usize = 10;

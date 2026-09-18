@@ -5315,6 +5315,7 @@ version = "0.1.0"
 dependencies = [
  "atomig",
  "hex",
+ "indicatif",
  "md5",
  "optfield",
  "regex",

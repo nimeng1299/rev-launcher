@@ -30,3 +30,4 @@ tempfile = "3"
 
 [dev-dependencies]
 rfd = "0.17.2"
+indicatif = "0.18.6"
