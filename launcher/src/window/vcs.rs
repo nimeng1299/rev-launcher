@@ -9,8 +9,9 @@ use gpui_kit::component::{ActiveTheme, IndexPath, StyledExt, WindowExt, h_flex};
 use gpui_kit::{
     AnyElement, App, AppContext, ClickEvent, Context, Entity, Hsla, InteractiveElement,
     IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, WeakEntity, Window, div, hsla, px,
+    Subscription, WeakEntity, Window, div, hsla, px, svg,
 };
+use std::collections::HashSet;
 
 use crate::jj;
 use crate::window::project_select::{ProjectList, ProjectSelect};
@@ -22,9 +23,15 @@ struct GraphRow {
     lanes_after: Vec<bool>,
     parent_lanes: Vec<usize>,
     lane_count: usize,
+    is_root: bool,
+    has_hidden_parent: bool,
 }
 
 fn graph_rows(commits: &[jj::CommitHistoryItem]) -> Vec<GraphRow> {
+    let visible_commit_ids = commits
+        .iter()
+        .map(|commit| commit.id.as_str())
+        .collect::<HashSet<_>>();
     let mut lanes: Vec<String> = Vec::new();
     let mut rows = Vec::with_capacity(commits.len());
 
@@ -38,7 +45,12 @@ fn graph_rows(commits: &[jj::CommitHistoryItem]) -> Vec<GraphRow> {
         };
         lanes.remove(node_lane);
 
-        for parent in commit.parents.iter().rev() {
+        for parent in commit
+            .parents
+            .iter()
+            .filter(|parent| visible_commit_ids.contains(parent.as_str()))
+            .rev()
+        {
             if let Some(existing_lane) = lanes.iter().position(|lane| lane == parent) {
                 lanes.remove(existing_lane);
             }
@@ -49,6 +61,7 @@ fn graph_rows(commits: &[jj::CommitHistoryItem]) -> Vec<GraphRow> {
         let parent_lanes = commit
             .parents
             .iter()
+            .filter(|parent| visible_commit_ids.contains(parent.as_str()))
             .filter_map(|parent| lanes.iter().position(|lane| lane == parent))
             .collect::<Vec<_>>();
         let lanes_after = lanes.iter().map(|_| true).collect::<Vec<_>>();
@@ -64,6 +77,11 @@ fn graph_rows(commits: &[jj::CommitHistoryItem]) -> Vec<GraphRow> {
             lanes_after,
             parent_lanes,
             lane_count,
+            is_root: commit.parents.is_empty(),
+            has_hidden_parent: commit
+                .parents
+                .iter()
+                .any(|parent| !visible_commit_ids.contains(parent.as_str())),
         });
     }
 
@@ -76,7 +94,6 @@ const GRAPH_SIDE_EDGE_Y: f32 = 33.;
 const GRAPH_LANE_WIDTH: f32 = 16.;
 const GRAPH_LEFT_PADDING: f32 = 10.;
 const GRAPH_LINE_WIDTH: f32 = 2.;
-const GRAPH_CORNER_RADIUS: f32 = 1.;
 
 fn graph_element(
     row: &GraphRow,
@@ -122,18 +139,26 @@ fn graph_element(
     }
 
     let node_x = GRAPH_LEFT_PADDING + row.node_lane as f32 * GRAPH_LANE_WIDTH;
-    let node_is_new_lane = !row
-        .lanes_before
-        .get(row.node_lane)
-        .copied()
-        .unwrap_or(false);
+    if row.has_hidden_parent {
+        graph = graph.child(
+            div()
+                .absolute()
+                .left(px(node_x))
+                .top(px(center_y))
+                .w(px(GRAPH_LINE_WIDTH))
+                .h(px(GRAPH_ROW_HEIGHT - center_y))
+                .bg(line_color),
+        );
+    }
+
     for parent_lane in &row.parent_lanes {
         let parent_x = GRAPH_LEFT_PADDING + *parent_lane as f32 * GRAPH_LANE_WIDTH;
         if (parent_x - node_x).abs() > f32::EPSILON {
             let left = node_x.min(parent_x);
-            if node_is_new_lane {
-                // A new side lane enters its node from below, like jj's `─╯`,
-                // instead of making the horizontal edge run directly into `◆`.
+            if row.parent_lanes.len() == 1 {
+                // A single-parent branch changes lanes below the node. This
+                // keeps the turn connected to the parent lane instead of
+                // drawing a horizontal line directly through the node.
                 let edge_y = GRAPH_SIDE_EDGE_Y;
                 graph = graph
                     .child(
@@ -143,7 +168,6 @@ fn graph_element(
                             .top(px(edge_y - 1.))
                             .w(px((node_x - parent_x).abs() + 2.))
                             .h(px(GRAPH_LINE_WIDTH))
-                            .rounded(px(GRAPH_CORNER_RADIUS))
                             .bg(line_color),
                     )
                     .child(
@@ -153,7 +177,6 @@ fn graph_element(
                             .top(px(center_y))
                             .w(px(GRAPH_LINE_WIDTH))
                             .h(px(edge_y - center_y + 1.))
-                            .rounded(px(GRAPH_CORNER_RADIUS))
                             .bg(line_color),
                     );
             } else {
@@ -170,18 +193,29 @@ fn graph_element(
         }
     }
 
-    graph
-        .child(
-            div()
-                .absolute()
-                .left(px(node_x - 4.))
-                .top(px(center_y - 4.))
-                .w(px(10.))
-                .h(px(10.))
-                .rounded(px(5.))
-                .bg(node_color),
-        )
-        .into_any_element()
+    let node = if row.is_root {
+        svg()
+            .absolute()
+            .left(px(node_x - 4.))
+            .top(px(center_y - 4.))
+            .w(px(10.))
+            .h(px(10.))
+            .text_color(node_color)
+            .data(br#"<svg viewBox="0 0 10 10"><path d="M5 0 L10 5 L5 10 L0 5 Z"/></svg>"#)
+            .into_any_element()
+    } else {
+        div()
+            .absolute()
+            .left(px(node_x - 4.))
+            .top(px(center_y - 4.))
+            .w(px(10.))
+            .h(px(10.))
+            .rounded(px(5.))
+            .bg(node_color)
+            .into_any_element()
+    };
+
+    graph.child(node).into_any_element()
 }
 
 fn unique_prefix_lengths(ids: &[String]) -> Vec<usize> {
@@ -911,6 +945,27 @@ mod tests {
         assert_eq!(rows[0].parent_lanes, vec![0]);
         assert_eq!(rows[1].parent_lanes, vec![0]);
         assert!(rows[2].parent_lanes.is_empty());
+        assert!(rows[2].is_root);
+    }
+
+    #[test]
+    fn graph_rows_drop_parents_outside_the_visible_history() {
+        let rows = graph_rows(&[commit("head", &["hidden"]), commit("other", &[])]);
+
+        assert!(rows.iter().all(|row| row.lane_count == 1));
+        assert!(rows.iter().all(|row| row.parent_lanes.is_empty()));
+        assert!(rows.iter().all(|row| row.lanes_after.is_empty()));
+        assert!(!rows[0].is_root);
+        assert!(rows[0].has_hidden_parent);
+        assert!(!rows[1].has_hidden_parent);
+    }
+
+    #[test]
+    fn graph_rows_mark_hidden_parent_continuation_without_creating_a_lane() {
+        let rows = graph_rows(&[commit("head", &["hidden"])]);
+
+        assert!(rows[0].has_hidden_parent);
+        assert!(rows[0].lanes_after.is_empty());
     }
 
     #[test]

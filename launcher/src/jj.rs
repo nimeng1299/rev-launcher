@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::process::Command;
 
 use anyhow::{Context, anyhow};
 use jj_lib::backend::CommitId;
@@ -52,6 +53,11 @@ pub struct CommitHistory {
     pub working_copy_commit_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitBackendInfo {
+    pub branch: Option<String>,
+}
+
 fn load_workspace(path: &Path) -> anyhow::Result<Workspace> {
     let settings = user_settings::create_user_settings(Some(path))?;
     let store_factories = default_backend_factories();
@@ -62,6 +68,45 @@ fn load_workspace(path: &Path) -> anyhow::Result<Workspace> {
 
 pub fn is_repo<P: AsRef<Path>>(path: P) -> bool {
     load_workspace(path.as_ref()).is_ok()
+}
+
+pub fn git_backend_info<P: AsRef<Path>>(path: P) -> Option<GitBackendInfo> {
+    let workspace = load_workspace(path.as_ref()).ok()?;
+    let repo = workspace.repo_loader().load_at_head().block_on().ok()?;
+    let git_repo = jj_lib::git::get_git_repo(repo.store()).ok()?;
+    let branch = git_repo
+        .head_name()
+        .ok()
+        .flatten()
+        .map(|name| name.shorten().to_string());
+
+    Some(GitBackendInfo { branch })
+}
+
+pub fn init_git_backend<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
+    let path = path.as_ref();
+    if path.join(".jj").exists() {
+        anyhow::bail!("该项目已经是 jj 仓库，但不是 Git backend；当前不能原地转换")
+    }
+
+    let settings = user_settings::create_user_settings(Some(path))?;
+    if !path.join(".git").exists() {
+        let status = Command::new("git")
+            .arg("init")
+            .arg("--")
+            .arg(path)
+            .status()
+            .context("failed to run git init")?;
+        if !status.success() {
+            anyhow::bail!("git init exited with status {status}");
+        }
+    }
+
+    Workspace::init_external_git(&settings, path, &path.join(".git"))
+        .block_on()
+        .context("failed to initialize jj workspace with the Git repository")?;
+
+    Ok(())
 }
 
 pub fn load_history<P: AsRef<Path>>(path: P, revset_str: &str) -> anyhow::Result<CommitHistory> {

@@ -1,4 +1,6 @@
-use gpui_kit::base::{StyledExt, v_flex};
+use gpui_kit::base::{Disableable, StyledExt, v_flex};
+use gpui_kit::component::WindowExt;
+use gpui_kit::component::button::Button;
 use gpui_kit::component::description_list::DescriptionList;
 use gpui_kit::component::label::Label;
 use gpui_kit::component::scroll::ScrollableElement;
@@ -11,13 +13,13 @@ use gpui_kit::{
 
 use mclib::project::game_project::{GameProject, ModLoader};
 
+use crate::jj;
 use crate::window::project_select::{ProjectList, ProjectSelect, loader_name};
 
 /// 开发页侧边栏里可以被选中的项。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DevelopSection {
     General,
-    Vcs,
     Mods,
     ResourcePacks,
     Shaders,
@@ -27,7 +29,6 @@ impl DevelopSection {
     fn label(self) -> &'static str {
         match self {
             Self::General => "通用",
-            Self::Vcs => "vcs",
             Self::Mods => "模组管理",
             Self::ResourcePacks => "资源包管理",
             Self::Shaders => "光影管理",
@@ -42,6 +43,7 @@ pub struct DevelopPage {
     project_select: ProjectSelect,
     /// 保活项目下拉框的事件订阅。
     _select_subscription: Subscription,
+    git_init_in_progress: bool,
 }
 
 impl DevelopPage {
@@ -68,6 +70,7 @@ impl DevelopPage {
             section: DevelopSection::General,
             project_select,
             _select_subscription: select_subscription,
+            git_init_in_progress: false,
         }
     }
 
@@ -94,7 +97,6 @@ impl DevelopPage {
                 SidebarGroup::new("版本设置").child(
                     SidebarMenu::new()
                         .child(self.menu_item(DevelopSection::General, cx))
-                        .child(self.menu_item(DevelopSection::Vcs, cx)),
                 ),
             )
             .child(
@@ -110,7 +112,6 @@ impl DevelopPage {
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let child = match self.section {
             DevelopSection::General => self.render_general(window, cx).into_any_element(),
-            DevelopSection::Vcs => self.render_vcs(window, cx).into_any_element(),
             section => card_outline().child(section.label()).into_any_element(),
         };
         v_flex().size_full().child(child)
@@ -119,24 +120,100 @@ impl DevelopPage {
     fn render_general(
         &mut self,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         // 第一张卡片是当前项目的基本信息，跟着顶部的下拉框走。
         let info_card = project_info_card(self.project_select.selected_project());
+
+        // 第二张卡片是仓库和项目资源转实例化。
+        let git_card = card_outline().gap_2().child(Label::new("版本控制"));
+        let Some(project) = self.project_select.selected_project() else {
+            return v_flex()
+                .size_full()
+                .overflow_y_scrollbar()
+                .child(git_card.child(Label::new("当前没有选中的整合包").text_color(rgb(0x9ca3af))));
+        };
+
+        let vcs_row = if let Some(info) = jj::git_backend_info(&project.path) {
+            DescriptionList::new()
+                .bordered(false)
+                .columns(1)
+                .label_width(px(72.))
+                .item(
+                    "当前分支",
+                    info.branch.unwrap_or_else(|| "detached HEAD".to_owned()),
+                    1,
+                )
+        } else {
+            let path = project.path.clone();
+            let button = Button::new("init-git-backend")
+                .label(if self.git_init_in_progress {
+                    "初始化中..."
+                } else {
+                    "初始化 Git 后端"
+                })
+                .disabled(self.git_init_in_progress)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.init_git_backend(path.clone(), window, cx);
+                }));
+
+            DescriptionList::new()
+                .bordered(false)
+                .columns(1)
+                .label_width(px(72.))
+                .item("仓库", button.into_any_element(), 1)
+        };
 
         v_flex()
             .size_full()
             .overflow_y_scrollbar()
             .gap_3()
             .child(info_card)
-            .child(card_outline())
+            .child(git_card.child(vcs_row))
     }
 
-    fn render_vcs(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .size_full()
-            .overflow_y_scrollbar()
-            .child(card_outline())
+    fn init_git_backend(
+        &mut self,
+        path: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.git_init_in_progress {
+            return;
+        }
+
+        self.git_init_in_progress = true;
+        cx.notify();
+
+        let page = cx.entity().downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { jj::init_git_backend(path) })
+                .await;
+
+            let _ = page.update_in(cx, |page, window, cx| {
+                page.git_init_in_progress = false;
+                match result {
+                    Ok(()) => window.push_notification(
+                        (
+                            gpui_kit::component::notification::NotificationType::Success,
+                            "已初始化 Git 后端",
+                        ),
+                        cx,
+                    ),
+                    Err(error) => window.push_notification(
+                        (
+                            gpui_kit::component::notification::NotificationType::Error,
+                            error.to_string(),
+                        ),
+                        cx,
+                    ),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 }
 
