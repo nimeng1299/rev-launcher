@@ -17,6 +17,7 @@ serde_with = {workspace = true}
 sha1 = {workspace = true}
 smart-default = {workspace = true}
 thiserror = {workspace = true}
+toml_edit = {workspace = true, features = ["serde"]}
 uuid = {workspace = true}
 ureq = {workspace = true, features = ["json"] }
 

@@ -12,12 +12,12 @@ pollster = {workspace = true}
 serde = {workspace = true, features = ["derive"] }
 serde_json = {workspace = true}
 smart-default = {workspace = true}
+# 和 jj-lib 用的是同一个版本(0.25)，读写 jj 的 config.toml 时能保留注释和格式
+toml_edit = {workspace = true}
 
 dirs = "7"
 chrono = "0.4"
 jj-lib = "0.45.1"
-# 和 jj-lib 用的是同一个版本，读写 jj 的 config.toml 时能保留注释和格式
-toml_edit = "0.25"
 gpui-kit = "0.6"
 rfd = "0.17.2"
 sysinfo = "0.31.4"
