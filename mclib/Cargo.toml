@@ -11,10 +11,14 @@ md5 = {workspace = true}
 hex = {workspace = true}
 optfield = {workspace = true}
 serde = {workspace = true, features = ["derive"]}
+serde_path_to_error = { workspace = true }
 serde_json = {workspace = true}
+serde_with = {workspace = true}
 sha1 = {workspace = true}
 smart-default = {workspace = true}
+thiserror = {workspace = true}
 uuid = {workspace = true}
+ureq = {workspace = true, features = ["json"] }
 
 regex = "1"
 shlex = "1"
@@ -22,3 +26,6 @@ sysinfo = "0.31.4"
 zip = { version = "2.4", default-features = false, features = ["deflate"] }
 
 tempfile = "3"
+
+[dev-dependencies]
+rfd = "0.17.2"

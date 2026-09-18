@@ -1,4 +1,3 @@
-pub mod java_error;
 pub mod java_version;
 
 use crate::java::java_version::JavaVersion;

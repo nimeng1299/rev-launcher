@@ -10,7 +10,8 @@ use gpui_kit::{
     AnyElement, App, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
     Render, SharedString, Styled, Window, div, px, uniform_list,
 };
-use mclib::launch::{LaunchError, LaunchInfo, LaunchState};
+use mclib::error::Error;
+use mclib::launch::{LaunchInfo, LaunchState};
 use sharingan::downloader::Downloader;
 use sharingan::status::DownloadStatus;
 use std::time::Duration;
@@ -136,22 +137,23 @@ fn bytes(value: u64) -> String {
     }
 }
 
-fn error_message(error: &LaunchError) -> String {
+fn error_message(error: &Error) -> String {
     match error {
-        LaunchError::AccountExpired => "账号已过期，请重新登录。".into(),
-        LaunchError::NotFindCorrectJava(version) => {
+        Error::AccountExpired => "账号已过期，请重新登录。".into(),
+        Error::NotFindCorrectJava(version) => {
             format!("未找到 Java {version}，请在设置中添加对应版本。")
         }
-        LaunchError::JavaCheckFailed(message)
-        | LaunchError::DownloadFailed(message)
-        | LaunchError::LaunchFailed(message)
-        | LaunchError::LogFailed(message) => message.clone(),
-        LaunchError::ProcessExited(Some(code)) => {
+        Error::ProcessExited(Some(code)) => {
             format!("游戏异常退出，退出码：{code}。请查看启动日志。")
         }
-        LaunchError::ProcessExited(None) => "游戏异常退出，请查看启动日志。".into(),
-        LaunchError::Json(error) => format!("版本配置无法读取：{error}"),
-        LaunchError::UnknownError => "启动失败，请查看启动日志。".into(),
+        Error::ProcessExited(None) => "游戏异常退出，请查看启动日志。".into(),
+        Error::Json(error) => format!("版本配置无法读取：{error}"),
+        Error::Io(error) => format!("文件读写失败：{error}"),
+        Error::NotFindSettingFile(path) => format!("未找到版本配置文件：{}", path.display()),
+        Error::UnknownError => "启动失败，请查看启动日志。".into(),
+        // JavaCheckFailed/DownloadFailed/LaunchFailed/LogFailed 等变体的
+        // Display 就是错误信息本身，直接透传即可。
+        other => other.to_string(),
     }
 }
 

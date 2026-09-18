@@ -20,20 +20,6 @@ pub use arguments::LaunchCommand;
 use logging::LaunchLog;
 pub use logging::{LaunchLogEntry, LaunchLogSource};
 
-#[derive(Debug)]
-pub enum LaunchError {
-    AccountExpired,
-    JavaCheckFailed(String),
-    /// 没有找到适合的Java版本，并附带一个正确的Java版本号
-    NotFindCorrectJava(i32),
-    DownloadFailed(String),
-    LaunchFailed(String),
-    LogFailed(String),
-    ProcessExited(Option<i32>),
-    Json(serde_json::Error),
-    UnknownError,
-}
-
 pub struct Launcher {
     account: Account,
     project: GameProject,
@@ -58,18 +44,18 @@ impl Launcher {
     }
 
     /// 检查已安装版本并构建启动命令，不启动 Java，也不写入游戏目录。
-    pub fn launch_command(&self) -> Result<LaunchCommand, LaunchError> {
+    pub fn launch_command(&self) -> Result<LaunchCommand, crate::error::Error> {
         let java = check_java(self)?;
         let json = self
             .project
             .read_json()
-            .map_err(|e| LaunchError::LaunchFailed(e.to_string()))?;
+            .map_err(|e| crate::error::Error::LaunchFailed(e.to_string()))?;
         LaunchCommand::build(self, &json, &java)
     }
 
     /// 校验并复用已安装实例的支持库，提交剩余下载任务；不启动 Java。
     /// 返回后应等待下载器完成，并检查每项任务是否成功。
-    pub fn download_libraries(&self) -> Result<Downloader, LaunchError> {
+    pub fn download_libraries(&self) -> Result<Downloader, crate::error::Error> {
         libraries::download(self, None)
     }
 }
@@ -94,7 +80,7 @@ pub enum LaunchState {
 #[derive(Clone)]
 pub struct LaunchInfo {
     state: Arc<Atomic<LaunchState>>,
-    error: Arc<Mutex<Option<Arc<LaunchError>>>>,
+    error: Arc<Mutex<Option<Arc<crate::error::Error>>>>,
     data: Arc<Launcher>,
     libraries_downloader: Arc<OnceLock<Arc<Downloader>>>,
     mods_downloader: Arc<OnceLock<Arc<Downloader>>>,
@@ -134,7 +120,7 @@ impl LaunchInfo {
         info
     }
 
-    fn run(&self) -> Result<(), LaunchError> {
+    fn run(&self) -> Result<(), crate::error::Error> {
         let log = LaunchLog::new(&self.data.project.path, &self.data.account.token)?;
         let log = self.log.get_or_init(|| log);
         let mut java = None;
@@ -185,12 +171,12 @@ impl LaunchInfo {
                 LaunchState::Launch => {
                     let java = java
                         .as_ref()
-                        .ok_or_else(|| LaunchError::LaunchFailed("尚未选择 Java".into()))?;
+                        .ok_or_else(|| crate::error::Error::LaunchFailed("尚未选择 Java".into()))?;
                     let json = self
                         .data
                         .project
                         .read_json()
-                        .map_err(|e| LaunchError::LaunchFailed(e.to_string()))?;
+                        .map_err(|e| crate::error::Error::LaunchFailed(e.to_string()))?;
                     let command = LaunchCommand::build(&self.data, &json, java)?;
                     command.prepare_natives()?;
                     logging::run_process(self, &command)?;
@@ -221,7 +207,7 @@ impl LaunchInfo {
     }
 
     /// 获取失败原因；只有发生错误时才返回 Some。
-    pub fn error(&self) -> Option<Arc<LaunchError>> {
+    pub fn error(&self) -> Option<Arc<crate::error::Error>> {
         self.error.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
@@ -263,7 +249,7 @@ impl LaunchInfo {
     }
 }
 
-fn downloads_finished(downloader: &Downloader) -> Result<bool, LaunchError> {
+fn downloads_finished(downloader: &Downloader) -> Result<bool, crate::error::Error> {
     if !downloader.is_finished() {
         return Ok(false);
     }
@@ -276,34 +262,34 @@ fn downloads_finished(downloader: &Downloader) -> Result<bool, LaunchError> {
     if failures.is_empty() {
         Ok(true)
     } else {
-        Err(LaunchError::DownloadFailed(format!(
+        Err(crate::error::Error::DownloadFailed(format!(
             "下载失败：{}",
             failures.join(", ")
         )))
     }
 }
 
-fn check_account(data: &Arc<Launcher>) -> Result<(), LaunchError> {
+fn check_account(data: &Arc<Launcher>) -> Result<(), crate::error::Error> {
     let check = data.account.check_token();
     if check {
         Ok(())
     } else {
-        Err(LaunchError::AccountExpired)
+        Err(crate::error::Error::AccountExpired)
     }
 }
 
-fn check_java(data: &Launcher) -> Result<JavaVersion, LaunchError> {
+fn check_java(data: &Launcher) -> Result<JavaVersion, crate::error::Error> {
     let value = data
         .project
         .read_json()
-        .map_err(|e| LaunchError::JavaCheckFailed(e.to_string()))?;
+        .map_err(|e| crate::error::Error::JavaCheckFailed(e.to_string()))?;
     // 旧版 Minecraft 清单未声明 javaVersion，使用 Java 8。
     let major_version = match value.pointer("/javaVersion/majorVersion") {
         Some(version) => version
             .as_i64()
             .filter(|version| (1..=i32::MAX as i64).contains(version))
             .ok_or_else(|| {
-                LaunchError::JavaCheckFailed("无效的 javaVersion.majorVersion".into())
+                crate::error::Error::JavaCheckFailed("无效的 javaVersion.majorVersion".into())
             })?,
         None => 8,
     };
@@ -320,7 +306,7 @@ fn check_java(data: &Launcher) -> Result<JavaVersion, LaunchError> {
         }
     }
 
-    Err(LaunchError::NotFindCorrectJava(major_version as i32))
+    Err(crate::error::Error::NotFindCorrectJava(major_version as i32))
 }
 
 /// 下载缺失的mod
@@ -383,8 +369,8 @@ struct CurseDownloadInfo {
 }
 
 impl CurseDownloadInfo {
-    fn from_json(json: &Value) -> Result<Self, LaunchError> {
-        serde_json::from_value(json.clone()).map_err(|e| LaunchError::Json(e))
+    fn from_json(json: &Value) -> Result<Self, crate::error::Error> {
+        serde_json::from_value(json.clone()).map_err(|e| crate::error::Error::Json(e))
     }
 }
 
@@ -510,7 +496,7 @@ mod tests {
         assert!(launch.mods_downloader().is_none());
         assert!(matches!(
             launch.error().as_deref(),
-            Some(LaunchError::JavaCheckFailed(_))
+            Some(crate::error::Error::JavaCheckFailed(_))
         ));
         assert!(launch.log_path().unwrap().is_file());
         assert!(
@@ -580,7 +566,7 @@ mod tests {
         data.javas.clear();
         assert!(matches!(
             check_java(&data),
-            Err(LaunchError::NotFindCorrectJava(8))
+            Err(crate::error::Error::NotFindCorrectJava(8))
         ));
     }
 

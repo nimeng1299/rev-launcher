@@ -1,4 +1,3 @@
-use crate::java::java_error::JavaError;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fmt::Formatter;
@@ -30,14 +29,14 @@ impl fmt::Display for JavaRuntime {
 }
 
 impl JavaVersion {
-    pub fn from_path(path: &PathBuf) -> Result<JavaVersion, JavaError> {
+    pub fn from_path(path: &PathBuf) -> Result<JavaVersion, crate::error::Error> {
         let output = Command::new(path)
             .arg("-version")
             .output()
-            .map_err(|e| JavaError::Io(e))?;
+            .map_err(|e| crate::error::Error::Io(e))?;
 
         if !output.status.success() {
-            return Err(JavaError::CommandRunFailed(format!(
+            return Err(crate::error::Error::CommandRunFailed(format!(
                 "执行 '{} -version' 失败",
                 path.display()
             )));
@@ -45,10 +44,10 @@ impl JavaVersion {
 
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        let first_line = stderr.lines().next().ok_or(JavaError::CommandNoOutput)?;
-        let version = extract_version_from_line(first_line).ok_or(JavaError::UnknownVersion)?;
+        let first_line = stderr.lines().next().ok_or(crate::error::Error::CommandNoOutput)?;
+        let version = extract_version_from_line(first_line).ok_or(crate::error::Error::UnknownVersion)?;
 
-        let parent = path.parent().ok_or(JavaError::NotJavaExecutableFile)?;
+        let parent = path.parent().ok_or(crate::error::Error::NotJavaExecutableFile)?;
         let javac_name = if cfg!(target_os = "windows") {
             "javac.exe"
         } else {
@@ -61,7 +60,7 @@ impl JavaVersion {
             JavaRuntime::JRE
         };
 
-        let major_version = parse_major_version(&version).ok_or(JavaError::UnknownVersion)?;
+        let major_version = parse_major_version(&version).ok_or(crate::error::Error::UnknownVersion)?;
 
         Ok(JavaVersion {
             java_runtime: runtime,

@@ -1,4 +1,3 @@
-use crate::project::game_project_error::GameProjectError;
 use crate::project::project_json_file::json_get_patches;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, from_str};
@@ -20,38 +19,38 @@ pub struct GameProject {
 impl GameProject {
     const PROJECT_FILE: &'static str = "project.json";
 
-    pub fn load(path_buf: &PathBuf) -> Result<Self, GameProjectError> {
+    pub fn load(path_buf: &PathBuf) -> Result<Self, crate::error::Error> {
         let filename = get_launcher_path(path_buf).join(Self::PROJECT_FILE);
         let context =
-            std::fs::read_to_string(filename).or_else(|e| Err(GameProjectError::Io(e)))?;
+            std::fs::read_to_string(filename).or_else(|e| Err(crate::error::Error::Io(e)))?;
         let data: Self =
-            serde_json::from_str(&context).or_else(|e| Err(GameProjectError::Json(e)))?;
+            serde_json::from_str(&context).or_else(|e| Err(crate::error::Error::Json(e)))?;
         Ok(data)
     }
 
-    pub fn save(&self) -> Result<(), GameProjectError> {
+    pub fn save(&self) -> Result<(), crate::error::Error> {
         let pick_path = get_launcher_path(&self.path);
-        std::fs::create_dir_all(&pick_path).or_else(|e| Err(GameProjectError::Io(e)))?;
+        std::fs::create_dir_all(&pick_path).or_else(|e| Err(crate::error::Error::Io(e)))?;
         let filename = pick_path.join(Self::PROJECT_FILE);
         let data =
-            serde_json::to_string_pretty(self).or_else(|e| Err(GameProjectError::Json(e)))?;
-        std::fs::write(filename, data).or_else(|e| Err(GameProjectError::Io(e)))
+            serde_json::to_string_pretty(self).or_else(|e| Err(crate::error::Error::Json(e)))?;
+        std::fs::write(filename, data).or_else(|e| Err(crate::error::Error::Io(e)))
     }
 
     ///  读取游戏目录下的<name>.json配置文件
-    pub fn read_json(&self) -> Result<Value, GameProjectError> {
+    pub fn read_json(&self) -> Result<Value, crate::error::Error> {
         let name = self
             .path
             .components()
             .last()
-            .ok_or(GameProjectError::UnknownPath)?
+            .ok_or(crate::error::Error::UnknownPath)?
             .as_os_str()
             .to_str()
-            .ok_or(GameProjectError::UnknownPath)?;
+            .ok_or(crate::error::Error::UnknownPath)?;
         let json_file = self.path.join(format!("{}.json", name));
         let contents =
-            std::fs::read_to_string(json_file).or_else(|e| Err(GameProjectError::Io(e)))?;
-        from_str(&contents).or_else(|e| Err(GameProjectError::Json(e)))
+            std::fs::read_to_string(json_file).or_else(|e| Err(crate::error::Error::Io(e)))?;
+        from_str(&contents).or_else(|e| Err(crate::error::Error::Json(e)))
     }
 }
 
@@ -85,7 +84,7 @@ pub fn find_all_game_in_project_folder(path_buf: &PathBuf) -> Vec<GameProject> {
 }
 
 /// 获取文件夹的游戏版本信息
-pub fn get_game_project(path_buf: &PathBuf) -> Result<GameProject, GameProjectError> {
+pub fn get_game_project(path_buf: &PathBuf) -> Result<GameProject, crate::error::Error> {
     // 1. 尝试从文件中读取
     if let Ok(game) = read_from_project_file(path_buf) {
         return Ok(game);
@@ -96,33 +95,33 @@ pub fn get_game_project(path_buf: &PathBuf) -> Result<GameProject, GameProjectEr
 }
 
 /// 尝试从启动器的版本文件中读取
-fn read_from_project_file(path_buf: &PathBuf) -> Result<GameProject, GameProjectError> {
+fn read_from_project_file(path_buf: &PathBuf) -> Result<GameProject, crate::error::Error> {
     GameProject::load(path_buf)
 }
 
 /// 尝试从目录下的同名json文件中读取
-fn read_from_json_file(path_buf: &PathBuf) -> Result<GameProject, GameProjectError> {
+fn read_from_json_file(path_buf: &PathBuf) -> Result<GameProject, crate::error::Error> {
     let name = path_buf
         .components()
         .last()
-        .ok_or(GameProjectError::UnknownPath)?
+        .ok_or(crate::error::Error::UnknownPath)?
         .as_os_str()
         .to_str()
-        .ok_or(GameProjectError::UnknownPath)?;
+        .ok_or(crate::error::Error::UnknownPath)?;
 
     let json_file = path_buf.join(format!("{}.json", name));
 
     match std::fs::metadata(&json_file) {
         Ok(metadata) => {
             if !metadata.is_file() {
-                return Err(GameProjectError::NotFindSettingFile(json_file));
+                return Err(crate::error::Error::NotFindSettingFile(json_file));
             }
         }
-        Err(e) => return Err(GameProjectError::Io(e)),
+        Err(e) => return Err(crate::error::Error::Io(e)),
     }
 
-    let contents = std::fs::read_to_string(json_file).or_else(|e| Err(GameProjectError::Io(e)))?;
-    let data: Value = from_str(&contents).or_else(|e| Err(GameProjectError::Json(e)))?;
+    let contents = std::fs::read_to_string(json_file).or_else(|e| Err(crate::error::Error::Io(e)))?;
+    let data: Value = from_str(&contents).or_else(|e| Err(crate::error::Error::Json(e)))?;
 
     // 通过patches来判断版本，所有未判断出来的统一为原版
     let lib = json_get_patches(&data)?;
@@ -189,5 +188,5 @@ fn read_from_json_file(path_buf: &PathBuf) -> Result<GameProject, GameProjectErr
         }
     }
 
-    Err(GameProjectError::UnknownPath)
+    Err(crate::error::Error::UnknownPath)
 }

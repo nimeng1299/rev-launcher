@@ -1,4 +1,4 @@
-use super::{LaunchCommand, LaunchError, LaunchInfo, LaunchState};
+use super::{LaunchCommand, LaunchInfo, LaunchState};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -34,12 +34,12 @@ pub(super) struct LaunchLog {
 }
 
 impl LaunchLog {
-    pub fn new(game_directory: &Path, token: &str) -> Result<Self, LaunchError> {
+    pub fn new(game_directory: &Path, token: &str) -> Result<Self, crate::error::Error> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let directory = std::path::absolute(game_directory)
-            .map_err(|e| LaunchError::LogFailed(e.to_string()))?
+            .map_err(|e| crate::error::Error::LogFailed(e.to_string()))?
             .join(".rev_launcher/logs");
-        std::fs::create_dir_all(&directory).map_err(|e| LaunchError::LogFailed(e.to_string()))?;
+        std::fs::create_dir_all(&directory).map_err(|e| crate::error::Error::LogFailed(e.to_string()))?;
         let time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -53,7 +53,7 @@ impl LaunchLog {
             .create_new(true)
             .append(true)
             .open(&path)
-            .map_err(|e| LaunchError::LogFailed(e.to_string()))?;
+            .map_err(|e| crate::error::Error::LogFailed(e.to_string()))?;
         Ok(Self {
             path,
             token: token.into(),
@@ -72,7 +72,7 @@ impl LaunchLog {
         }
     }
 
-    pub fn write(&self, source: LaunchLogSource, message: &str) -> Result<(), LaunchError> {
+    pub fn write(&self, source: LaunchLogSource, message: &str) -> Result<(), crate::error::Error> {
         let time = SystemTime::now();
         let timestamp = time.duration_since(UNIX_EPOCH).unwrap_or_default();
         let message = self.redact(message);
@@ -84,7 +84,7 @@ impl LaunchLog {
             timestamp.subsec_millis()
         )
         .and_then(|_| data.file.flush())
-        .map_err(|e| LaunchError::LogFailed(e.to_string()))?;
+        .map_err(|e| crate::error::Error::LogFailed(e.to_string()))?;
         // 文件保留完整日志，供界面轮询的内存快照只保留最近 2,000 条。
         if data.recent.len() == 2000 {
             data.recent.pop_front();
@@ -112,7 +112,7 @@ fn copy_output(
     reader: impl Read,
     log: &LaunchLog,
     source: LaunchLogSource,
-) -> Result<(), LaunchError> {
+) -> Result<(), crate::error::Error> {
     let mut reader = BufReader::new(reader);
     let mut bytes = Vec::new();
     let mut log_error = None;
@@ -120,7 +120,7 @@ fn copy_output(
         bytes.clear();
         let count = reader
             .read_until(b'\n', &mut bytes)
-            .map_err(|e| LaunchError::LogFailed(format!("读取 {source:?} 失败：{e}")))?;
+            .map_err(|e| crate::error::Error::LogFailed(format!("读取 {source:?} 失败：{e}")))?;
         if count == 0 {
             break;
         }
@@ -136,11 +136,11 @@ fn copy_output(
     }
 }
 
-pub(super) fn run_process(info: &LaunchInfo, launch: &LaunchCommand) -> Result<(), LaunchError> {
+pub(super) fn run_process(info: &LaunchInfo, launch: &LaunchCommand) -> Result<(), crate::error::Error> {
     let log = info
         .log
         .get()
-        .ok_or_else(|| LaunchError::LogFailed("启动日志尚未初始化".into()))?;
+        .ok_or_else(|| crate::error::Error::LogFailed("启动日志尚未初始化".into()))?;
     log.write(
         LaunchLogSource::Launcher,
         &format!("工作目录：{}", launch.working_directory.display()),
@@ -165,7 +165,7 @@ pub(super) fn run_process(info: &LaunchInfo, launch: &LaunchCommand) -> Result<(
         command.creation_flags(0x08000000);
     }
     let mut child = command.spawn().map_err(|e| {
-        LaunchError::LaunchFailed(format!("无法启动 {}：{e}", launch.java.display()))
+        crate::error::Error::LaunchFailed(format!("无法启动 {}：{e}", launch.java.display()))
     })?;
     info.process_id.get_or_init(|| child.id());
     info.state.store(LaunchState::Running, Ordering::SeqCst);
@@ -186,11 +186,11 @@ pub(super) fn run_process(info: &LaunchInfo, launch: &LaunchCommand) -> Result<(
         (status, out.join(), err.join())
     });
     let status =
-        status.map_err(|e| LaunchError::LaunchFailed(format!("等待 Java 退出失败：{e}")))?;
+        status.map_err(|e| crate::error::Error::LaunchFailed(format!("等待 Java 退出失败：{e}")))?;
     info.exit_status.get_or_init(|| status);
     started_log?;
-    stdout_result.map_err(|_| LaunchError::LogFailed("stdout 日志线程异常退出".into()))??;
-    stderr_result.map_err(|_| LaunchError::LogFailed("stderr 日志线程异常退出".into()))??;
+    stdout_result.map_err(|_| crate::error::Error::LogFailed("stdout 日志线程异常退出".into()))??;
+    stderr_result.map_err(|_| crate::error::Error::LogFailed("stderr 日志线程异常退出".into()))??;
     log.write(
         LaunchLogSource::Launcher,
         &format!("Java 进程 {} 已退出：{status}", child.id()),
@@ -198,7 +198,7 @@ pub(super) fn run_process(info: &LaunchInfo, launch: &LaunchCommand) -> Result<(
     if status.success() {
         Ok(())
     } else {
-        Err(LaunchError::ProcessExited(status.code()))
+        Err(crate::error::Error::ProcessExited(status.code()))
     }
 }
 
@@ -264,7 +264,7 @@ mod tests {
         let (_project, info, mut command) = fixture("exit_unsuccessfully");
         assert!(matches!(
             run_process(&info, &command),
-            Err(LaunchError::ProcessExited(Some(7)))
+            Err(crate::error::Error::ProcessExited(Some(7)))
         ));
         assert_eq!(info.exit_status().unwrap().code(), Some(7));
         assert!(
@@ -276,7 +276,7 @@ mod tests {
         command.java = command.working_directory.join("missing-java-executable");
         assert!(matches!(
             run_process(&info, &command),
-            Err(LaunchError::LaunchFailed(_))
+            Err(crate::error::Error::LaunchFailed(_))
         ));
     }
 

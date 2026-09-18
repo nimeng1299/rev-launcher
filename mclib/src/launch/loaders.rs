@@ -1,5 +1,4 @@
 //! 按加载器选择运行依赖；launchTarget 是入口名称，不能作为加载器类型。
-use super::LaunchError;
 use super::arguments::{RuleContext, rules_allow};
 use super::libraries::Artifact;
 use crate::project::game_project::ModLoader;
@@ -12,7 +11,7 @@ pub(super) struct LoaderProfile {
 }
 
 impl LoaderProfile {
-    pub fn from_json(json: &Value, fallback: &ModLoader) -> Result<Self, LaunchError> {
+    pub fn from_json(json: &Value, fallback: &ModLoader) -> Result<Self, crate::error::Error> {
         let arguments = game_arguments(json)?;
         let main = json.get("mainClass").and_then(Value::as_str).unwrap_or("");
         let patch = |id: &str| {
@@ -91,7 +90,7 @@ impl LoaderProfile {
         }
     }
 
-    pub fn runtime_libraries(&self) -> Result<Vec<Artifact>, LaunchError> {
+    pub fn runtime_libraries(&self) -> Result<Vec<Artifact>, crate::error::Error> {
         match self.kind {
             // 原版和 Fabric 的运行库由版本清单列出，不添加 FML 安装产物。
             ModLoader::Minecraft | ModLoader::Fabric => Ok(Vec::new()),
@@ -113,22 +112,22 @@ impl LoaderProfile {
         }
     }
 
-    fn required(&self, name: &str) -> Result<&str, LaunchError> {
+    fn required(&self, name: &str) -> Result<&str, crate::error::Error> {
         option(&self.arguments, name)
             .filter(|value| !value.is_empty() && !value.starts_with("--"))
             .ok_or_else(|| {
-                LaunchError::DownloadFailed(format!("{} 启动参数缺少 {name}", self.name()))
+                crate::error::Error::DownloadFailed(format!("{} 启动参数缺少 {name}", self.name()))
             })
     }
 
-    fn forge_runtime(&self) -> Result<Vec<Artifact>, LaunchError> {
+    fn forge_runtime(&self) -> Result<Vec<Artifact>, crate::error::Error> {
         if !self.bootstrap || option(&self.arguments, "--launchTarget") != Some("forgeclient") {
             return Ok(Vec::new());
         }
         self.mcp_runtime("net.minecraftforge", "https://maven.minecraftforge.net")
     }
 
-    fn neoforge_runtime(&self) -> Result<Vec<Artifact>, LaunchError> {
+    fn neoforge_runtime(&self) -> Result<Vec<Artifact>, crate::error::Error> {
         if !self.bootstrap
             || !matches!(
                 option(&self.arguments, "--launchTarget"),
@@ -159,7 +158,7 @@ impl LoaderProfile {
         Ok(artifacts)
     }
 
-    fn mcp_runtime(&self, group: &str, repository: &str) -> Result<Vec<Artifact>, LaunchError> {
+    fn mcp_runtime(&self, group: &str, repository: &str) -> Result<Vec<Artifact>, crate::error::Error> {
         let forge = self.required("--fml.forgeVersion")?;
         let minecraft = self.required("--fml.mcVersion")?;
         let mcp = self.required("--fml.mcpVersion")?;
@@ -193,7 +192,7 @@ impl LoaderProfile {
     }
 }
 
-fn client_libraries(minecraft: &str, mappings: &str) -> Result<Vec<Artifact>, LaunchError> {
+fn client_libraries(minecraft: &str, mappings: &str) -> Result<Vec<Artifact>, crate::error::Error> {
     ["srg", "extra"]
         .into_iter()
         .map(|classifier| {
@@ -216,7 +215,7 @@ fn option<'a>(arguments: &'a [String], name: &str) -> Option<&'a str> {
     })
 }
 
-fn game_arguments(json: &Value) -> Result<Vec<String>, LaunchError> {
+fn game_arguments(json: &Value) -> Result<Vec<String>, crate::error::Error> {
     let Some(values) = json.pointer("/arguments/game").and_then(Value::as_array) else {
         return Ok(Vec::new());
     };
@@ -234,14 +233,14 @@ fn game_arguments(json: &Value) -> Result<Vec<String>, LaunchError> {
                             value
                                 .as_str()
                                 .ok_or_else(|| {
-                                    LaunchError::DownloadFailed("参数 value 必须为字符串".into())
+                                    crate::error::Error::DownloadFailed("参数 value 必须为字符串".into())
                                 })?
                                 .to_owned(),
                         );
                     }
                 }
                 _ => {
-                    return Err(LaunchError::DownloadFailed(
+                    return Err(crate::error::Error::DownloadFailed(
                         "条件参数缺少有效的 value".into(),
                     ));
                 }

@@ -1,4 +1,4 @@
-use super::{LaunchError, Launcher};
+use super::Launcher;
 use crate::account::AccountType;
 use crate::java::java_version::JavaVersion;
 use crate::settings::GameWindowSize;
@@ -21,11 +21,11 @@ pub struct LaunchCommand {
     native_archives: Vec<(PathBuf, Vec<String>)>,
 }
 
-pub(super) fn invalid(message: impl Into<String>) -> LaunchError {
-    LaunchError::LaunchFailed(message.into())
+pub(super) fn invalid(message: impl Into<String>) -> crate::error::Error {
+    crate::error::Error::LaunchFailed(message.into())
 }
 
-pub(super) fn relative_path(value: &str) -> Result<PathBuf, LaunchError> {
+pub(super) fn relative_path(value: &str) -> Result<PathBuf, crate::error::Error> {
     // 同时检查两种路径分隔符，避免在不同平台上解释出不同的目标路径。
     let path = PathBuf::from(value.replace('\\', "/"));
     if value.is_empty()
@@ -39,7 +39,7 @@ pub(super) fn relative_path(value: &str) -> Result<PathBuf, LaunchError> {
     Ok(path)
 }
 
-pub(super) fn library_path(library: &Value) -> Result<Option<PathBuf>, LaunchError> {
+pub(super) fn library_path(library: &Value) -> Result<Option<PathBuf>, crate::error::Error> {
     if let Some(path) = library
         .pointer("/downloads/artifact/path")
         .and_then(Value::as_str)
@@ -56,7 +56,7 @@ pub(super) fn library_path(library: &Value) -> Result<Option<PathBuf>, LaunchErr
     maven_path(name).map(Some)
 }
 
-pub(super) fn maven_path(name: &str) -> Result<PathBuf, LaunchError> {
+pub(super) fn maven_path(name: &str) -> Result<PathBuf, crate::error::Error> {
     let (coordinate, extension) = name.split_once('@').unwrap_or((name, "jar"));
     let parts: Vec<_> = coordinate.split(':').collect();
     if !(3..=4).contains(&parts.len())
@@ -82,7 +82,7 @@ pub(super) fn maven_path(name: &str) -> Result<PathBuf, LaunchError> {
     ))
 }
 
-pub(super) fn native_artifact(library: &Value) -> Result<Option<Value>, LaunchError> {
+pub(super) fn native_artifact(library: &Value) -> Result<Option<Value>, crate::error::Error> {
     let os = if cfg!(target_os = "macos") {
         "osx"
     } else {
@@ -138,7 +138,7 @@ impl RuleContext {
     }
 }
 
-pub(super) fn rules_allow(value: &Value, context: &RuleContext) -> Result<bool, LaunchError> {
+pub(super) fn rules_allow(value: &Value, context: &RuleContext) -> Result<bool, crate::error::Error> {
     let Some(rules) = value.get("rules") else {
         return Ok(true);
     };
@@ -187,7 +187,7 @@ pub(super) fn rules_allow(value: &Value, context: &RuleContext) -> Result<bool, 
     Ok(allowed)
 }
 
-fn expand(template: &str, variables: &HashMap<&str, String>) -> Result<String, LaunchError> {
+fn expand(template: &str, variables: &HashMap<&str, String>) -> Result<String, crate::error::Error> {
     let mut result = String::new();
     let mut remaining = template;
     while let Some(start) = remaining.find("${") {
@@ -212,7 +212,7 @@ fn expand_arguments(
     value: &Value,
     context: &RuleContext,
     variables: &HashMap<&str, String>,
-) -> Result<Vec<String>, LaunchError> {
+) -> Result<Vec<String>, crate::error::Error> {
     let values = value
         .as_array()
         .ok_or_else(|| invalid("arguments.jvm/game 必须是数组"))?;
@@ -240,7 +240,7 @@ fn expand_arguments(
     Ok(arguments)
 }
 
-fn require_file(path: &Path) -> Result<(), LaunchError> {
+fn require_file(path: &Path) -> Result<(), crate::error::Error> {
     if path.is_file() {
         Ok(())
     } else {
@@ -253,7 +253,7 @@ impl LaunchCommand {
         data: &Launcher,
         json: &Value,
         java: &JavaVersion,
-    ) -> Result<Self, LaunchError> {
+    ) -> Result<Self, crate::error::Error> {
         if json.get("inheritsFrom").is_some() {
             return Err(invalid(
                 "请先合并 inheritsFrom 指定的父版本 JSON，再启动此版本",
@@ -533,7 +533,7 @@ impl LaunchCommand {
         })
     }
 
-    pub(super) fn prepare_natives(&self) -> Result<(), LaunchError> {
+    pub(super) fn prepare_natives(&self) -> Result<(), crate::error::Error> {
         std::fs::create_dir_all(&self.natives_directory)
             .map_err(|e| invalid(format!("创建 natives 目录失败：{e}")))?;
         for (path, excludes) in &self.native_archives {
@@ -594,7 +594,7 @@ mod tests {
         (project, data, json)
     }
 
-    fn build(data: &Launcher, json: &Value) -> Result<LaunchCommand, LaunchError> {
+    fn build(data: &Launcher, json: &Value) -> Result<LaunchCommand, crate::error::Error> {
         LaunchCommand::build(data, json, data.setting.java.as_ref().unwrap())
     }
 
@@ -748,17 +748,17 @@ mod tests {
         let (project, data, mut json) = fixture();
         json["arguments"]["game"] = json!(["${unsupported}"]);
         assert!(
-            matches!(build(&data, &json), Err(LaunchError::LaunchFailed(message)) if message.contains("unsupported"))
+            matches!(build(&data, &json), Err(crate::error::Error::LaunchFailed(message)) if message.contains("unsupported"))
         );
         json["arguments"]["game"] = json!([]);
         json["assetIndex"] = json!({"id":"missing"});
         assert!(
-            matches!(build(&data, &json), Err(LaunchError::LaunchFailed(message)) if message.contains("missing.json"))
+            matches!(build(&data, &json), Err(crate::error::Error::LaunchFailed(message)) if message.contains("missing.json"))
         );
         json.as_object_mut().unwrap().remove("assetIndex");
         std::fs::remove_file(project.path.join("instance/instance.jar")).unwrap();
         assert!(
-            matches!(build(&data, &json), Err(LaunchError::LaunchFailed(message)) if message.contains("instance.jar"))
+            matches!(build(&data, &json), Err(crate::error::Error::LaunchFailed(message)) if message.contains("instance.jar"))
         );
         for path in ["../outside", "C:\\outside", "/absolute", "..\\outside"] {
             assert!(relative_path(path).is_err());

@@ -4,7 +4,7 @@ use super::arguments::{
 };
 use super::loaders::LoaderProfile;
 use super::logging::LaunchLog;
-use super::{LaunchError, LaunchLogSource, Launcher};
+use super::{LaunchLogSource, Launcher};
 use crate::project::game_project::ModLoader;
 use serde::Deserialize;
 use serde_json::Value;
@@ -15,8 +15,8 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
-fn failed(message: impl Into<String>) -> LaunchError {
-    LaunchError::DownloadFailed(message.into())
+fn failed(message: impl Into<String>) -> crate::error::Error {
+    crate::error::Error::DownloadFailed(message.into())
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -34,9 +34,9 @@ pub(super) struct Artifact {
 }
 
 impl Artifact {
-    fn from_json(path: PathBuf, json: &Value) -> Result<Self, LaunchError> {
+    fn from_json(path: PathBuf, json: &Value) -> Result<Self, crate::error::Error> {
         let mut metadata: Metadata =
-            serde_json::from_value(json.clone()).map_err(LaunchError::Json)?;
+            serde_json::from_value(json.clone()).map_err(crate::error::Error::Json)?;
         metadata.url = metadata.url.filter(|url| !url.is_empty());
         metadata.sha1 = metadata.sha1.filter(|sha1| !sha1.is_empty());
         if let Some(sha1) = &metadata.sha1
@@ -51,7 +51,7 @@ impl Artifact {
         })
     }
 
-    pub(super) fn maven(name: &str, repository: Option<&str>) -> Result<Self, LaunchError> {
+    pub(super) fn maven(name: &str, repository: Option<&str>) -> Result<Self, crate::error::Error> {
         let path = maven_path(name)?;
         let url = repository.map(|base| {
             format!(
@@ -112,7 +112,7 @@ impl Artifact {
     }
 }
 
-fn artifacts(json: &Value, loader: &LoaderProfile) -> Result<Vec<Artifact>, LaunchError> {
+fn artifacts(json: &Value, loader: &LoaderProfile) -> Result<Vec<Artifact>, crate::error::Error> {
     let libraries = json
         .get("libraries")
         .and_then(Value::as_array)
@@ -176,7 +176,7 @@ fn artifacts(json: &Value, loader: &LoaderProfile) -> Result<Vec<Artifact>, Laun
     Ok(result)
 }
 
-fn logging_artifact(json: &Value) -> Result<Option<Artifact>, LaunchError> {
+fn logging_artifact(json: &Value) -> Result<Option<Artifact>, crate::error::Error> {
     if json.pointer("/logging/client/argument").is_none() {
         return Ok(None);
     }
@@ -190,7 +190,7 @@ fn logging_artifact(json: &Value) -> Result<Option<Artifact>, LaunchError> {
     Artifact::from_json(logging_cache_path(name)?, file).map(Some)
 }
 
-pub(super) fn logging_cache_path(name: &str) -> Result<PathBuf, LaunchError> {
+pub(super) fn logging_cache_path(name: &str) -> Result<PathBuf, crate::error::Error> {
     let name = relative_path(name)?;
     if name.components().count() != 1 || name.file_name().is_none() {
         return Err(failed("logging.client.file.id 必须是文件名"));
@@ -209,7 +209,7 @@ fn source_roots(instance: &Path) -> Vec<PathBuf> {
     roots
 }
 
-fn copy_library(source: &Path, target: &Path, artifact: &Artifact) -> Result<(), LaunchError> {
+fn copy_library(source: &Path, target: &Path, artifact: &Artifact) -> Result<(), crate::error::Error> {
     let parent = target
         .parent()
         .ok_or_else(|| failed("支持库路径缺少父目录"))?;
@@ -236,7 +236,7 @@ fn copy_library(source: &Path, target: &Path, artifact: &Artifact) -> Result<(),
 pub(super) fn download(
     data: &Launcher,
     log: Option<&LaunchLog>,
-) -> Result<Downloader, LaunchError> {
+) -> Result<Downloader, crate::error::Error> {
     let json = data
         .project
         .read_json()
@@ -353,7 +353,7 @@ pub(super) fn validate_runtime(
     json: &Value,
     root: &Path,
     fallback: &ModLoader,
-) -> Result<(), LaunchError> {
+) -> Result<(), crate::error::Error> {
     let loader = LoaderProfile::from_json(json, fallback)?;
     let missing: Vec<_> = loader
         .runtime_libraries()?
@@ -366,7 +366,7 @@ pub(super) fn validate_runtime(
     if missing.is_empty() {
         return Ok(());
     }
-    Err(LaunchError::LaunchFailed(format!(
+    Err(crate::error::Error::LaunchFailed(format!(
         "{} 运行库缺失或损坏，请先准备支持库：\n{}",
         loader.name(),
         missing.join("\n")
@@ -381,14 +381,14 @@ mod tests {
     use std::io::Write;
     use std::time::{Duration, Instant};
 
-    fn artifacts(json: &Value) -> Result<Vec<Artifact>, LaunchError> {
+    fn artifacts(json: &Value) -> Result<Vec<Artifact>, crate::error::Error> {
         super::artifacts(
             json,
             &LoaderProfile::from_json(json, &ModLoader::Minecraft)?,
         )
     }
 
-    fn runtime(json: &Value) -> Result<Vec<Artifact>, LaunchError> {
+    fn runtime(json: &Value) -> Result<Vec<Artifact>, crate::error::Error> {
         LoaderProfile::from_json(json, &ModLoader::Minecraft)?.runtime_libraries()
     }
 
