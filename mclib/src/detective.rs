@@ -5,3 +5,4 @@
 pub mod curseforge;
 pub mod modrinth;
 pub mod base;
+pub mod mod_info;

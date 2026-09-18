@@ -2,6 +2,8 @@
 //!
 //! 所有可能为 null 的字段用 `DefaultOnNull` 处理，null 自动变成默认值。
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
 use serde_with::{serde_as, DefaultOnNull};
 
@@ -145,17 +147,66 @@ pub struct VersionFileHashes {
     pub sha512: String,
 }
 
-/// 从 JSON 字符串解析 Modrinth version。
+/// 从 JSON 字符串解析 Modrinth 批量 version_files 接口的响应。
+///
+/// 响应是以请求时的 sha1 为键的映射：`{ "<sha1>": {version} }`。
 ///
 /// 出错时返回 `(path, message)`，path 形如
 /// `$.files[0].hashes.sha1` 或 `<root>`。
-pub fn parse_fingerprint_response(body: &str) -> Result<ModrinthInfo, crate::error::Error> {
+pub fn parse_version_files_response(
+    body: &str,
+) -> Result<HashMap<String, ModrinthInfo>, crate::error::Error> {
     let mut de = serde_json::Deserializer::from_str(body);
-    match serde_path_to_error::deserialize::<_, ModrinthInfo>(&mut de) {
+    match serde_path_to_error::deserialize::<_, HashMap<String, ModrinthInfo>>(&mut de) {
         Ok(v) => Ok(v),
         Err(e) => Err(crate::error::Error::Deserialize {
             path: e.path().to_string(),
             message: e.into_inner().to_string(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_version_files_response;
+
+    #[test]
+    fn parse_batch_response_test() {
+        // 来自 POST /v2/version_files 的真实响应（截取），含 null 字段和未知字段
+        let body = r#"{
+            "d67e66ea4bb2409997b636dae4203d33764cdcc8": {
+                "game_versions": ["1.21", "1.21.1"],
+                "loaders": ["fabric"],
+                "environment": "client_only",
+                "id": "RncWhTxD",
+                "project_id": "AANobbMI",
+                "author_id": "DzLrfrbK",
+                "featured": true,
+                "name": "Sodium 0.5.11",
+                "version_number": "mc1.21-0.5.11",
+                "changelog_url": null,
+                "date_published": "2024-06-29T13:45:49.041594Z",
+                "downloads": 9620717,
+                "version_type": "release",
+                "status": "listed",
+                "requested_status": null,
+                "files": [],
+                "dependencies": []
+            }
+        }"#;
+
+        let map = parse_version_files_response(body).unwrap();
+        assert_eq!(map.len(), 1);
+
+        let info = &map["d67e66ea4bb2409997b636dae4203d33764cdcc8"];
+        assert_eq!(info.name, "Sodium 0.5.11");
+        assert_eq!(info.project_id, "AANobbMI");
+        assert_eq!(info.loaders, vec!["fabric"]);
+    }
+
+    #[test]
+    fn parse_empty_response_test() {
+        let map = parse_version_files_response("{}").unwrap();
+        assert!(map.is_empty());
     }
 }

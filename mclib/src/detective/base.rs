@@ -1,13 +1,9 @@
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
 use crate::error::Error;
 use crate::project::game_project::GameProject;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ModInfo{
-    name: String,
 
-}
+
 
 fn detective_path(project: &GameProject) -> PathBuf{
     project.path.join("rev-launcher")
