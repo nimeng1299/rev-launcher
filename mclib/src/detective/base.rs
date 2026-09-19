@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
@@ -71,7 +71,8 @@ pub fn serialize_mods(
     Ok(rx)
 }
 
-/// 线程内的实际序列化流程，成功时返回写入的文件数量
+/// 线程内的实际序列化流程，成功时返回处理（写入或跳过）的文件数量。
+/// 对应 toml 已存在且记录的 sha1 与当前 jar 一致时跳过该 jar，不重新查询和写入。
 fn serialize_mods_in_thread(
     jars: Vec<PathBuf>,
     out_dir: PathBuf,
@@ -88,55 +89,87 @@ fn serialize_mods_in_thread(
         return Ok(0);
     }
 
-    send(SerializeModsProgress::QueryCurseforge);
-    let curse_matches = find_curse_info_with_rev_ua(jars.iter().collect::<Vec<_>>())?;
-    let mut curse_by_fingerprint: HashMap<i64, CurseforgeInfo> = HashMap::new();
-    for m in curse_matches.exact_matches {
-        curse_by_fingerprint.insert(
-            m.file.file_fingerprint,
-            CurseforgeInfo {
-                project_id: m.id,
-                file_id: m.file.id,
-            },
-        );
-    }
-
-    send(SerializeModsProgress::QueryModrinth);
-    let modrinth_versions = find_modrinth_info_with_rev_ua(jars.iter().collect::<Vec<_>>())?;
-
     let total = jars.len();
     send(SerializeModsProgress::WriteStart { total });
 
+    // 预计算每个 jar 的 sha1；已序列化过且哈希一致的视为有效，跳过后续查询
+    let mut sha1_by_jar: HashMap<&PathBuf, String> = HashMap::new();
+    let mut fresh: HashSet<&PathBuf> = HashSet::new();
     for (index, jar) in jars.iter().enumerate() {
         let Some(filename) = jar.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-
-        let curseforge = fingerprint(jar)
-            .ok()
-            .map(|fp| fp as i64)
-            .and_then(|fp| curse_by_fingerprint.get(&fp).cloned());
-
-        let modrinth = modrinth_sha1(jar)
-            .ok()
-            .and_then(|sha1| modrinth_versions.get(&sha1))
-            .map(|version| ModrinthInfo {
-                id: version.id.clone(),
-            });
-
-        let info = ModInfo {
-            filename: filename.to_string(),
-            curseforge,
-            modrinth,
+        let Ok(sha1) = modrinth_sha1(jar) else {
+            continue;
         };
+        let toml_path = out_dir.join(format!("{}.toml", filename));
+        if let Ok(content) = std::fs::read_to_string(&toml_path)
+            && let Ok(info) = toml_edit::de::from_str::<ModInfo>(&content)
+            && info.sha1.as_deref() == Some(sha1.as_str())
+        {
+            fresh.insert(jar);
+            send(SerializeModsProgress::WriteDone {
+                index,
+                filename: filename.to_string(),
+            });
+            continue;
+        }
+        sha1_by_jar.insert(jar, sha1);
+    }
 
-        let toml = toml_edit::ser::to_string_pretty(&info)?;
-        std::fs::write(out_dir.join(format!("{}.toml", filename)), toml)?;
+    let to_query: Vec<&PathBuf> = jars.iter().filter(|jar| !fresh.contains(jar)).collect();
+    if !to_query.is_empty() {
+        send(SerializeModsProgress::QueryCurseforge);
+        let curse_matches = find_curse_info_with_rev_ua(to_query.clone())?;
+        let mut curse_by_fingerprint: HashMap<i64, CurseforgeInfo> = HashMap::new();
+        for m in curse_matches.exact_matches {
+            curse_by_fingerprint.insert(
+                m.file.file_fingerprint,
+                CurseforgeInfo {
+                    project_id: m.id,
+                    file_id: m.file.id,
+                },
+            );
+        }
 
-        send(SerializeModsProgress::WriteDone {
-            index,
-            filename: filename.to_string(),
-        });
+        send(SerializeModsProgress::QueryModrinth);
+        let modrinth_versions = find_modrinth_info_with_rev_ua(to_query)?;
+
+        for (index, jar) in jars.iter().enumerate() {
+            if fresh.contains(jar) {
+                continue;
+            }
+            let Some(filename) = jar.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+
+            let curseforge = fingerprint(jar)
+                .ok()
+                .map(|fp| fp as i64)
+                .and_then(|fp| curse_by_fingerprint.get(&fp).cloned());
+
+            let modrinth = sha1_by_jar
+                .get(jar)
+                .and_then(|sha1| modrinth_versions.get(sha1))
+                .map(|version| ModrinthInfo {
+                    id: version.id.clone(),
+                });
+
+            let info = ModInfo {
+                filename: filename.to_string(),
+                sha1: sha1_by_jar.get(jar).cloned(),
+                curseforge,
+                modrinth,
+            };
+
+            let toml = toml_edit::ser::to_string_pretty(&info)?;
+            std::fs::write(out_dir.join(format!("{}.toml", filename)), toml)?;
+
+            send(SerializeModsProgress::WriteDone {
+                index,
+                filename: filename.to_string(),
+            });
+        }
     }
 
     send(SerializeModsProgress::Done { total });
@@ -346,6 +379,7 @@ mod tests {
     use super::list_jars;
     use super::read_mod_infos;
     use super::serialize_mods;
+    use super::serialize_mods_in_thread;
     use super::{DownloadChannel, ResolvedDownload, prepare_mod_download, resolve_download_info};
     use crate::detective::mod_info::{CurseforgeInfo, ModInfo, ModrinthInfo};
     use crate::project::game_project::{GameProject, ModLoader};
@@ -372,6 +406,7 @@ mod tests {
         for filename in ["a.jar", "b.jar"] {
             let info = ModInfo {
                 filename: filename.into(),
+                sha1: None,
                 curseforge: None,
                 modrinth: None,
             };
@@ -470,6 +505,7 @@ mod tests {
     fn retry_excludes_the_used_channel() {
         let info = ModInfo {
             filename: "mod.jar".into(),
+            sha1: None,
             curseforge: None,
             modrinth: Some(ModrinthInfo {
                 id: "must-not-be-queried".into(),
@@ -481,6 +517,7 @@ mod tests {
         );
         let info = ModInfo {
             filename: "mod.jar".into(),
+            sha1: None,
             modrinth: None,
             curseforge: Some(CurseforgeInfo {
                 project_id: 0,
@@ -521,6 +558,7 @@ mod tests {
     fn mod_info_toml_format_test() {
         let info = ModInfo {
             filename: "sodium.jar".to_string(),
+            sha1: None,
             curseforge: Some(CurseforgeInfo {
                 project_id: 394468,
                 file_id: 5594023,
@@ -540,6 +578,7 @@ mod tests {
         // 没匹配到信息时只序列化 filename
         let info = ModInfo {
             filename: "unknown.jar".to_string(),
+            sha1: None,
             curseforge: None,
             modrinth: None,
         };
@@ -580,12 +619,53 @@ mod tests {
         assert_eq!(events.len(), 2);
     }
 
+    /// toml 已存在且记录的 sha1 与当前 jar 一致时直接跳过：
+    /// 不发起平台查询，也不重写 toml。
+    #[test]
+    fn serialize_mods_in_thread_skips_fresh_toml_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join(".rev_launcher/mods");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let jar_path = dir.path().join("sodium.jar");
+        std::fs::write(&jar_path, b"jar content").unwrap();
+        let sha1 = crate::detective::modrinth::modrinth_sha1_bytes(b"jar content");
+        let info = ModInfo {
+            filename: "sodium.jar".into(),
+            sha1: Some(sha1),
+            curseforge: None,
+            modrinth: None,
+        };
+        let toml_path = out_dir.join("sodium.jar.toml");
+        let original = toml_edit::ser::to_string_pretty(&info).unwrap();
+        std::fs::write(&toml_path, &original).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handled = serialize_mods_in_thread(vec![jar_path], out_dir, &tx).unwrap();
+        drop(tx);
+        let events: Vec<_> = rx.into_iter().collect();
+
+        assert_eq!(handled, 1);
+        assert!(
+            matches!(events.first(), Some(Ok(SerializeModsProgress::WriteStart { total: 1 }))),
+            "events: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(Ok(SerializeModsProgress::Done { total: 1 }))),
+            "events: {events:?}"
+        );
+        // 只有 WriteStart/WriteDone/Done，没有 Query 事件
+        assert_eq!(events.len(), 3, "events: {events:?}");
+        assert_eq!(std::fs::read_to_string(&toml_path).unwrap(), original);
+    }
+
     /// serialize 写出的 toml 能被 read_mod_infos 读回
     #[test]
     fn read_mod_infos_round_trip_test() {
         let dir = tempfile::tempdir().unwrap();
         let full = ModInfo {
             filename: "sodium.jar".to_string(),
+            sha1: None,
             curseforge: Some(CurseforgeInfo {
                 project_id: 394468,
                 file_id: 5594023,
@@ -596,6 +676,7 @@ mod tests {
         };
         let only_name = ModInfo {
             filename: "unknown.jar".to_string(),
+            sha1: None,
             curseforge: None,
             modrinth: None,
         };
