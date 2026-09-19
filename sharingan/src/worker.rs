@@ -65,8 +65,8 @@ impl Worker {
     /// 每轮循环依次执行：
     /// 1. 检查取消标记：若已取消，则删除正在下载任务的临时文件、把任务放入
     ///    完成表并退出循环；
-    /// 2. 若存在已领取的任务，先执行前置回调，成功且未取消时调用内部 `download`
-    ///    完成下载并清理临时文件；无论成功或失败，都把任务移入完成表；
+    /// 2. 若存在已领取的任务，先执行前置回调，成功且未取消、未要求跳过时调用
+    ///    内部 `download` 完成下载并清理临时文件；随后把任务移入完成表；
     /// 3. 否则尝试从就绪队列领取一个新任务；若队列为空则休眠 100ms，避免忙等。
     pub fn run(&mut self) {
         loop {
@@ -83,16 +83,9 @@ impl Worker {
             }
 
             if let Some(task) = self.ongoing_tasks.take() {
-                if let Err(reason) = task.prepare() {
-                    task.change_failure(reason);
-                } else if self.status.load(Ordering::SeqCst) == TaskStatus::Cancel {
-                    task.change_failure(DownloadFailure::UserCancel);
-                } else {
-                    task.change_downloading();
-                    download(task.clone());
-                    // 不管有没有成功都要清除缓存
-                    let filename = task.path().join(task.temp_filename());
-                    let _ = std::fs::remove_file(&filename);
+                match download_task(&task, &self.status) {
+                    Ok(()) => task.change_success(),
+                    Err(reason) => task.change_failure(reason),
                 }
 
                 self.finish_map.insert(task.id(), task);
@@ -109,128 +102,95 @@ impl Worker {
     }
 }
 
-/// 实际执行一次 HTTP 下载，并更新任务状态与进度。
-///
-/// 流程：发起 GET 请求 → 校验 HTTP 状态码 → 解析 `Content-Length` 更新总大小 →
-/// 创建保存目录与临时文件 → 边读边写、按读取间隔估算速度并更新进度 →
-/// `sync_all` 落盘 → 校验临时文件 → 按需删除旧文件 → 把临时文件重命名为最终文件名。
-///
-/// 任意一步失败都会通过 `Task::change_failure` 记录失败原因；
-/// 全部成功则通过 `Task::change_success` 标记任务完成。
-fn download(task: Arc<Task>) {
+/// 一个任务的前置处理、下载和按顺序尝试的备用配置。
+/// 仅在整个流程结束后发布成功或失败，避免调用方在重试前误判任务已完成。
+fn download_task(task: &Task, status: &Atomic<TaskStatus>) -> Result<(), DownloadFailure> {
+    task.prepare()?;
+    let mut fallbacks = task.options().fallbacks.iter().enumerate();
+    loop {
+        if status.load(Ordering::SeqCst) == TaskStatus::Cancel {
+            return Err(DownloadFailure::UserCancel);
+        }
+        if task.options().skip_download {
+            return Ok(());
+        }
+        task.change_downloading();
+        let result = download(task);
+        let _ = std::fs::remove_file(task.path().join(task.temp_filename()));
+        let Err(mut reason) = result else {
+            return Ok(());
+        };
+        loop {
+            if status.load(Ordering::SeqCst) == TaskStatus::Cancel {
+                return Err(DownloadFailure::UserCancel);
+            }
+            let Some((index, fallback)) = fallbacks.next() else {
+                return Err(reason);
+            };
+            match task.prepare_fallback(index, fallback) {
+                Ok(()) => break,
+                Err(error) => reason = error,
+            }
+        }
+    }
+}
+
+/// 执行一次下载并更新进度；校验通过后才覆盖最终文件。
+fn download(task: &Task) -> Result<(), DownloadFailure> {
     let agent = Agent::config_builder()
-        .timeout_global(task.timeout().clone())
+        .timeout_global(*task.timeout())
         .build()
         .new_agent();
-
     let mut request = agent.get(task.url());
-
     for (key, value) in task.query() {
         request = request.query(key, value);
     }
-
     for (key, value) in task.header() {
         request = request.header(key, value);
     }
-
-    let response = match request.call() {
-        Ok(response) => response,
-        Err(e) => {
-            task.change_failure(DownloadFailure::NetworkError(e));
-            return;
-        }
-    };
-
+    let response = request.call().map_err(DownloadFailure::NetworkError)?;
     if !response.status().is_success() {
-        let status = response.status();
-        task.change_failure(DownloadFailure::HttpStatusCode(status));
-        return;
+        return Err(DownloadFailure::HttpStatusCode(response.status()));
     }
-
     let total_size = response
         .headers()
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
-
     task.progress().change_total(total_size);
-
-    if let Err(e) = std::fs::create_dir_all(task.path()) {
-        task.change_failure(DownloadFailure::IOError(e));
-        return;
-    }
+    std::fs::create_dir_all(task.path()).map_err(DownloadFailure::IOError)?;
     let temp_filename = task.path().join(task.temp_filename());
-    let mut file = match File::create(temp_filename) {
-        Ok(file) => file,
-        Err(e) => {
-            task.change_failure(DownloadFailure::IOError(e));
-            return;
-        }
-    };
+    let mut file = File::create(&temp_filename).map_err(DownloadFailure::IOError)?;
     let mut reader = response.into_body().into_reader();
     let mut buffer = [0; 8192];
     let mut downloaded: u64 = 0;
-
     loop {
         let start = Instant::now();
-
-        let bytes_read = match reader.read(&mut buffer) {
-            Ok(read) => read,
-            Err(e) => {
-                task.change_failure(DownloadFailure::IOError(e));
-                return;
-            }
-        };
+        let bytes_read = reader.read(&mut buffer).map_err(DownloadFailure::IOError)?;
         if bytes_read == 0 {
             break;
         }
-        match file.write_all(&buffer[..bytes_read]) {
-            Ok(_) => {}
-            Err(e) => {
-                task.change_failure(DownloadFailure::IOError(e));
-                return;
-            }
-        };
+        file.write_all(&buffer[..bytes_read])
+            .map_err(DownloadFailure::IOError)?;
         downloaded += bytes_read as u64;
-
-        let end = start.elapsed().as_millis() as f64;
-        let speed = if end >= 10f64 {
-            //防止间隔太短速度为+inf
-            bytes_read as f64 / (end / 1000.0)
+        let elapsed = start.elapsed().as_millis() as f64;
+        let speed = if elapsed >= 10.0 {
+            bytes_read as f64 / (elapsed / 1000.0)
         } else {
             task.progress().speed()
         };
         task.progress().update(downloaded, speed);
     }
-
-    match file.sync_all() {
-        Ok(_) => {
-            let temp_filename = task.path().join(task.temp_filename());
-            if let Some(validator) = task.validator() {
-                if let Err(reason) = validator(temp_filename.clone()) {
-                    task.change_failure(reason);
-                    let _ = std::fs::remove_file(temp_filename);
-                    return;
-                }
-            }
-
-            if task.overwrite() {
-                let _ = std::fs::remove_file(&task.path().join(task.filename()));
-            }
-
-            match std::fs::rename(temp_filename, task.path().join(task.filename())) {
-                Ok(_) => {
-                    task.change_success();
-                }
-                Err(e) => {
-                    task.change_failure(DownloadFailure::IOError(e));
-                }
-            }
-        }
-        Err(e) => {
-            task.change_failure(DownloadFailure::IOError(e));
-        }
-    };
+    file.sync_all().map_err(DownloadFailure::IOError)?;
+    drop(file);
+    if let Some(validator) = task.validator() {
+        validator(temp_filename.clone())?;
+    }
+    if task.overwrite() {
+        let _ = std::fs::remove_file(task.path().join(task.filename()));
+    }
+    std::fs::rename(temp_filename, task.path().join(task.filename()))
+        .map_err(DownloadFailure::IOError)
 }
 
 #[cfg(test)]
@@ -251,6 +211,41 @@ mod tests {
             assert!(Instant::now() < deadline, "等待任务结束超时");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn preparation_can_skip_download_without_touching_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("cached.bin");
+        std::fs::write(&target, b"cached").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/unused", listener.local_addr().unwrap());
+        let path = directory.path().to_path_buf();
+        let mut downloader = DownloadBuilder::new().build();
+        downloader.download(move |builder| {
+            builder
+                .url(url)
+                .path(path)
+                .filename("cached.bin".into())
+                .overwrite(true)
+                .before_download(|mut options| {
+                    options.skip_download = true;
+                    Ok(options)
+                })
+                .validator(|_| panic!("跳过下载时不应执行下载后校验"))
+                .build()
+        });
+        wait_until_finished(&downloader);
+        assert!(downloader.is_all_success());
+        let task = &downloader.tasks()[&0];
+        assert_eq!(task.progress().downloaded(), 0);
+        assert!(!task.path().join(task.temp_filename()).exists());
+        assert_eq!(std::fs::read(target).unwrap(), b"cached");
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     fn serve_file() -> (String, std::thread::JoinHandle<String>) {
@@ -289,6 +284,270 @@ mod tests {
             request
         });
         (url, server)
+    }
+
+    #[test]
+    fn fallback_keeps_task_pending_until_the_second_download_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("first");
+        let second_path = directory.path().join("second");
+        let expected_path = second_path.clone();
+        let (first_url, first_server) = serve_file();
+        let (second_url, second_server) = serve_file();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let mut downloader = DownloadBuilder::new().build();
+        downloader.download(move |builder| {
+            builder
+                .url(first_url)
+                .path(first_path)
+                .filename("mod.jar".into())
+                .timeout(Some(Duration::from_secs(5)))
+                .validator(|_| Err(DownloadFailure::ValidationError))
+                .before_download(move |mut options| {
+                    options.add_fallback(move |mut options| {
+                        entered_tx.send(()).unwrap();
+                        release_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap();
+                        options.url = second_url.clone();
+                        options.path = second_path.clone();
+                        options.validator = Some(Arc::new(|path| {
+                            assert_eq!(std::fs::read(path).unwrap(), b"test");
+                            Ok(())
+                        }));
+                        Ok(options)
+                    });
+                    Ok(options)
+                })
+                .build()
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let task = downloader.tasks()[&0].clone();
+        assert!(matches!(task.status(), DownloadStatus::Preparing));
+        assert!(!downloader.is_finished());
+        assert_eq!(downloader.finish_map().iter().count(), 0);
+        assert!(!task.path().join(task.temp_filename()).exists());
+        release_tx.send(()).unwrap();
+        wait_until_finished(&downloader);
+        first_server.join().unwrap();
+        second_server.join().unwrap();
+        assert!(downloader.is_all_success());
+        assert_eq!(downloader.tasks().len(), 1);
+        assert!(Arc::ptr_eq(&task, &downloader.tasks()[&0]));
+        assert_eq!(task.path(), &expected_path);
+        assert_eq!(task.progress().downloaded(), 4);
+        assert_eq!(task.progress().total(), Some(4));
+        assert_eq!(
+            std::fs::read(expected_path.join("mod.jar")).unwrap(),
+            b"test"
+        );
+        assert!(!task.path().join(task.temp_filename()).exists());
+    }
+
+    #[test]
+    fn multiple_fallbacks_continue_after_errors_and_stop_on_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().to_path_buf();
+        let (first_url, first_server) = serve_file();
+        let (final_url, final_server) = serve_file();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut downloader = DownloadBuilder::new().build();
+        let order_in_callbacks = order.clone();
+        downloader.download(move |builder| {
+            let first_order = order_in_callbacks.clone();
+            let second_order = order_in_callbacks.clone();
+            builder
+                .url("invalid-primary".into())
+                .path(path)
+                .filename("mod.jar".into())
+                .timeout(Some(Duration::from_secs(5)))
+                .add_fallback(move |_| {
+                    first_order.lock().unwrap().push(1);
+                    Err(DownloadFailure::PreparationError(
+                        "mirror unavailable".into(),
+                    ))
+                })
+                .add_fallback(move |mut options| {
+                    second_order.lock().unwrap().push(2);
+                    options.url = first_url.clone();
+                    options.validator = Some(Arc::new(|_| Err(DownloadFailure::ValidationError)));
+                    Ok(options)
+                })
+                .before_download(move |mut options| {
+                    // 动态追加的配置位于 Builder 已添加的配置之后。
+                    options.add_fallback(move |mut options| {
+                        order_in_callbacks.lock().unwrap().push(3);
+                        started_tx.send(()).unwrap();
+                        release_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap();
+                        options.url = final_url.clone();
+                        options.filename = "final.jar".into();
+                        options.validator = None;
+                        Ok(options)
+                    });
+                    options.add_fallback(|_| panic!("成功后不应尝试剩余配置"));
+                    Ok(options)
+                })
+                .build()
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let task = downloader.tasks()[&0].clone();
+        // 保留第二个备用配置的引用，下一次发布不会使旧引用失效。
+        let previous = task.options();
+        let previous_url = previous.url.clone();
+        assert_eq!(previous.filename, "mod.jar");
+        assert_eq!(task.progress().downloaded(), 4);
+        assert!(!downloader.is_finished());
+        assert!(matches!(task.status(), DownloadStatus::Preparing));
+        assert!(!task.path().join(task.temp_filename()).exists());
+        release_tx.send(()).unwrap();
+        wait_until_finished(&downloader);
+        first_server.join().unwrap();
+        final_server.join().unwrap();
+        assert_eq!(*order.lock().unwrap(), [1, 2, 3]);
+        assert!(downloader.is_all_success());
+        assert_eq!(downloader.tasks().len(), 1);
+        assert_eq!(task.filename(), "final.jar");
+        assert_eq!(task.progress().downloaded(), 4);
+        assert_eq!(previous.url, previous_url);
+        assert_eq!(previous.filename, "mod.jar");
+        assert_eq!(
+            std::fs::read(directory.path().join("final.jar")).unwrap(),
+            b"test"
+        );
+        assert!(!directory.path().join("mod.jar").exists());
+    }
+
+    #[test]
+    fn many_fallbacks_are_consumed_in_order_and_report_the_last_error() {
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let order_in_callbacks = order.clone();
+        let mut downloader = DownloadBuilder::new().build();
+        downloader.download(move |mut builder| {
+            for index in 0..128 {
+                let order = order_in_callbacks.clone();
+                builder = builder.add_fallback(move |mut options| {
+                    order.lock().unwrap().push(index);
+                    if index % 2 == 0 {
+                        options.url = "invalid-mirror".into();
+                        Ok(options)
+                    } else {
+                        Err(DownloadFailure::PreparationError(format!("mirror {index}")))
+                    }
+                });
+            }
+            builder.url("invalid-primary".into()).build()
+        });
+        wait_until_finished(&downloader);
+        assert_eq!(*order.lock().unwrap(), (0..128).collect::<Vec<_>>());
+        let task = &downloader.tasks()[&0];
+        assert!(task.status().is_failed());
+        assert!(
+            matches!(&*task.failed_reason(), DownloadFailure::PreparationError(message)
+            if message == "mirror 127")
+        );
+    }
+
+    #[test]
+    fn fallback_skip_stops_remaining_options() {
+        let mut downloader = DownloadBuilder::new().build();
+        downloader.download(|builder| {
+            builder
+                .url("invalid-primary".into())
+                .add_fallback(|_| Err(DownloadFailure::PreparationError("unavailable".into())))
+                .add_fallback(|mut options| {
+                    options.skip_download = true;
+                    Ok(options)
+                })
+                .add_fallback(|_| panic!("跳过后不应尝试剩余配置"))
+                .build()
+        });
+        wait_until_finished(&downloader);
+        assert!(downloader.is_all_success());
+        assert!(downloader.tasks()[&0].options().skip_download);
+        assert_eq!(downloader.tasks()[&0].progress().downloaded(), 0);
+    }
+
+    #[test]
+    fn fallback_runs_once_and_records_its_final_error() {
+        for preparation_error in [false, true] {
+            let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let attempts_in_callback = attempts.clone();
+            let mut downloader = DownloadBuilder::new().build();
+            downloader.download(move |builder| {
+                builder
+                    .url("invalid-url".into())
+                    .before_download(move |mut options| {
+                        options.add_fallback(move |mut options| {
+                            attempts_in_callback.fetch_add(1, Ordering::SeqCst);
+                            if preparation_error {
+                                Err(DownloadFailure::PreparationError("no fallback".into()))
+                            } else {
+                                // 备用回调中新加的配置不会进入已固定的调度列表。
+                                options.add_fallback(|_| panic!("不应动态重复入队"));
+                                Ok(options)
+                            }
+                        });
+                        Ok(options)
+                    })
+                    .build()
+            });
+            wait_until_finished(&downloader);
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            let task = &downloader.tasks()[&0];
+            assert!(task.status().is_failed());
+            match &*task.failed_reason() {
+                DownloadFailure::PreparationError(message) if preparation_error => {
+                    assert_eq!(message, "no fallback");
+                }
+                DownloadFailure::NetworkError(_) if !preparation_error => {}
+                reason => panic!("备用渠道错误未保留: {reason:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_during_fallback_stops_the_retry() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let mut downloader = DownloadBuilder::new().build();
+        downloader.download(move |builder| {
+            builder
+                .url("invalid-url".into())
+                .before_download(move |mut options| {
+                    options.add_fallback(move |mut options| {
+                        entered_tx.send(()).unwrap();
+                        release_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap();
+                        options.skip_download = true;
+                        Ok(options)
+                    });
+                    options.add_fallback(|_| panic!("取消后不应尝试剩余配置"));
+                    Ok(options)
+                })
+                .build()
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        downloader.cancel();
+        release_tx.send(()).unwrap();
+        wait_until_finished(&downloader);
+        let task = &downloader.tasks()[&0];
+        assert!(task.status().is_failed());
+        assert!(matches!(*task.failed_reason(), DownloadFailure::UserCancel));
     }
 
     #[test]

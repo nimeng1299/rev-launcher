@@ -28,14 +28,14 @@ pub enum TaskStatus {
 pub enum DownloadStatus {
     /// 已就绪，等待 Worker 领取。
     Ready,
+    /// 正在执行下载前置回调，尚未发起下载请求。
+    Preparing,
     /// 正在下载中。
     Downloading,
-    /// 下载成功，临时文件已重命名为最终文件名。
+    /// 下载成功，或前置回调已确认无需下载。
     Succeeded,
     /// 下载失败，失败原因见 [`DownloadFailure`]。
     Failed,
-    /// 正在执行下载前置回调，尚未发起下载请求。
-    Preparing,
 }
 
 impl DownloadStatus {

@@ -6,7 +6,7 @@ use crate::progress::Progress;
 use crate::status::{DownloadFailure, DownloadStatus};
 use atomig::Atomic;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,6 +15,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// 回调接收已完整写入并同步到磁盘的临时文件路径：返回 `Ok(())` 表示校验通过，
 /// 返回 `Err(reason)` 表示校验失败，失败原因会记录到任务中。
 pub type DownloadValidator = Arc<dyn Fn(PathBuf) -> Result<(), DownloadFailure> + Send + Sync>;
+
+/// 下载或校验失败后，在 Worker 中解析下一个备用配置。
+pub type DownloadFallback =
+    Arc<dyn Fn(DownloadOptions) -> Result<DownloadOptions, DownloadFailure> + Send + Sync>;
 
 /// 下载所需的配置，前置回调可以补全或替换其中的任意字段。
 #[derive(Clone, Default)]
@@ -31,10 +35,27 @@ pub struct DownloadOptions {
     pub filename: String,
     /// 是否覆盖已存在的文件。
     pub overwrite: bool,
+    /// 前置回调确认无需下载时设为 `true`：任务直接成功，不发请求或执行下载后校验。
+    pub skip_download: bool,
     /// 网络请求超时；不包含前置回调的执行时间。
     pub timeout: Option<Duration>,
     /// 下载完成后的完整性校验。
     pub validator: Option<DownloadValidator>,
+    /// 按添加顺序尝试的备用配置，无固定数量上限，每项最多执行一次。
+    /// 备用配置解析、下载或校验失败后继续下一项，全部失败时记录最后的错误。
+    /// 初始前置回调失败或取消不会触发；成功或跳过后不再尝试剩余配置。
+    /// 列表在初始前置回调成功后固定，备用回调收到的配置不包含此列表。
+    pub fallbacks: Vec<DownloadFallback>,
+}
+
+impl DownloadOptions {
+    /// 追加一个备用配置解析回调，可在初始前置回调中调用任意多次。
+    pub fn add_fallback<F>(&mut self, fallback: F)
+    where
+        F: Fn(DownloadOptions) -> Result<DownloadOptions, DownloadFailure> + Send + Sync + 'static,
+    {
+        self.fallbacks.push(Arc::new(fallback));
+    }
 }
 
 /// 在 Worker 中执行一次的下载前置回调；只有返回 `Ok` 才继续下载。
@@ -60,6 +81,10 @@ pub struct Task {
     options: DownloadOptions,
     /// 前置回调成功后一次性发布的最终配置。
     prepared_options: OnceLock<DownloadOptions>,
+    /// 每个备用配置各占一个槽位，保留已发布配置以保证外部引用有效。
+    fallback_options: OnceLock<Vec<OnceLock<DownloadOptions>>>,
+    /// 当前备用配置下标加一；0 表示仍使用初始/前置配置。
+    current_fallback: AtomicUsize,
     /// 由领取任务的 Worker 取出并执行一次。
     before_download: Mutex<Option<DownloadPreparation>>,
     /// 下载过程中的临时文件名，下载完成后会被重命名为最终文件名。
@@ -111,6 +136,8 @@ impl Task {
             id: builder.id,
             options: builder.options,
             prepared_options: OnceLock::new(),
+            fallback_options: OnceLock::new(),
+            current_fallback: AtomicUsize::new(0),
             before_download: Mutex::new(builder.before_download),
             temp_filename,
             status: Atomic::new(DownloadStatus::Ready),
@@ -124,11 +151,17 @@ impl Task {
         self.id
     }
 
-    /// 返回当前配置：前置回调成功前为初始配置，成功后为最终配置。
+    /// 返回当前配置：初始配置、前置回调配置或重试时发布的备用配置。
     ///
     /// 需要同时读取多个字段时，可通过此方法取得同一份配置快照。
     /// 先前取得的初始配置引用仍然有效，但不会随前置回调自动更新。
     pub fn options(&self) -> &DownloadOptions {
+        let current = self.current_fallback.load(Ordering::SeqCst);
+        if current > 0 {
+            return self.fallback_options.get().expect("备用配置槽位已初始化")[current - 1]
+                .get()
+                .expect("当前备用配置已发布");
+        }
         self.prepared_options.get().unwrap_or(&self.options)
     }
 
@@ -143,6 +176,30 @@ impl Task {
             let options = prepare(self.options.clone())?;
             let _ = self.prepared_options.set(options);
         }
+        let _ = self.fallback_options.set(
+            (0..self.options().fallbacks.len())
+                .map(|_| OnceLock::new())
+                .collect(),
+        );
+        Ok(())
+    }
+
+    /// Worker 按顺序执行备用回调；失败时保留上一份已发布配置。
+    pub(crate) fn prepare_fallback(
+        &self,
+        index: usize,
+        fallback: &DownloadFallback,
+    ) -> Result<(), DownloadFailure> {
+        self.change_preparing();
+        let mut options = self.options().clone();
+        options.fallbacks.clear();
+        let mut options = fallback(options)?;
+        // 调度列表已固定，回调返回的列表不能让已执行的备用配置重新入队。
+        options.fallbacks.clear();
+        let _ = self.fallback_options.get().expect("备用配置槽位已初始化")[index].set(options);
+        self.progress.change_total(None);
+        self.progress.update(0, 0.0);
+        self.current_fallback.store(index + 1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -207,7 +264,7 @@ impl Task {
 
     /// 把任务状态切换为「成功」。
     ///
-    /// 由 Worker 线程在下载完成、临时文件落盘并重命名后调用。
+    /// 由 Worker 线程在下载完成、临时文件落盘并重命名后，或前置回调确认跳过时调用。
     pub fn change_success(&self) {
         self.status
             .store(DownloadStatus::Succeeded, Ordering::SeqCst);
@@ -337,6 +394,35 @@ impl TaskBuilder {
         self
     }
 
+    /// 追加一个备用配置，无固定数量上限。下载失败后按添加顺序尝试，成功即停止。
+    ///
+    /// 回调接收上一次成功发布的配置，可替换地址、请求头、文件名和校验器等。
+    /// 回调返回 `Err` 时继续下一项；返回 `Ok` 后重置进度并尝试下载。
+    /// 初始前置回调可通过 [`DownloadOptions::add_fallback`] 继续追加。
+    /// 备用回调中添加的配置不会加入已经固定的调度列表。
+    ///
+    /// ```no_run
+    /// use sharingan::task::TaskBuilder;
+    /// let mut builder = TaskBuilder::new(0)
+    ///     .url("https://example.com/file.bin".into())
+    ///     .path("downloads".into())
+    ///     .filename("file.bin".into());
+    /// for url in ["https://mirror1.example.com/file.bin", "https://mirror2.example.com/file.bin"] {
+    ///     builder = builder.add_fallback(move |mut options| {
+    ///         options.url = url.into();
+    ///         Ok(options)
+    ///     });
+    /// }
+    /// let task = builder.build();
+    /// ```
+    pub fn add_fallback<F>(mut self, fallback: F) -> Self
+    where
+        F: Fn(DownloadOptions) -> Result<DownloadOptions, DownloadFailure> + Send + Sync + 'static,
+    {
+        self.options.add_fallback(fallback);
+        self
+    }
+
     /// 设置下载完成后的完整性校验回调。
     ///
     /// 回调接收已完整写入并同步到磁盘的临时文件路径。返回 `Ok(())` 才会将
@@ -368,6 +454,8 @@ impl TaskBuilder {
     /// 回调在 Worker 线程中执行一次，接收构建器的完整配置，可在此查询元数据、
     /// 确定 URL、文件名、请求头等。返回 `Ok(options)` 才会发起下载请求；
     /// 返回 `Err(reason)` 则记录失败原因并结束任务，不创建下载文件。
+    /// 若已验证本地文件可直接使用，可设置 [`DownloadOptions::skip_download`]，
+    /// 返回 `Ok(options)` 后任务直接成功，不发起下载请求。
     /// 多个任务的前置回调与下载共用线程池，并发上限为下载器的 `thread_num`。
     /// 回调执行期间状态为 [`DownloadStatus::Preparing`]，不计入网络请求超时。
     /// 取消不会强行中断回调，但回调返回后会检查取消状态，避免继续下载。

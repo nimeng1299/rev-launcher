@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
-use std::time::Duration;
 
 use sharingan::downloader::{DownloadBuilder, Downloader};
-use sharingan::status::{DownloadFailure, DownloadStatus};
-use sharingan::task::TaskBuilder;
+use sharingan::status::DownloadFailure;
+use sharingan::task::DownloadOptions;
 
 use crate::detective::curseforge::{
     find_curse_file_info_with_rev_ua, find_curse_info_with_rev_ua, fingerprint,
@@ -18,7 +18,7 @@ use crate::detective::modrinth::{
 use crate::error::Error;
 use crate::project::game_project::GameProject;
 
-fn detective_path(project: &GameProject) -> PathBuf{
+fn detective_path(project: &GameProject) -> PathBuf {
     project.path.join(".rev_launcher")
 }
 
@@ -147,72 +147,42 @@ fn serialize_mods_in_thread(
 // 反序列化：读取 toml 信息并下载 mod
 // ---------------------------------------------------------------------------
 
-/// [`deserialize_mods`] 在工作线程中发出的进度事件。
+/// 读取 `<项目>/.rev_launcher/mods/*.toml` 并提交 mod 下载任务，立即返回下载器。
 ///
-/// 通过返回的 channel 接收；channel 关闭表示整个流程结束。
-/// 每个 mod 最终恰好产生一个 [`DeserializeModsProgress::Skipped`]、
-/// [`DeserializeModsProgress::Downloaded`] 或 [`DeserializeModsProgress::Failed`]
-/// 事件。
-#[derive(Debug, Clone)]
-pub enum DeserializeModsProgress {
-    /// 开始处理，total 为待处理的 mod 数量（toml 文件数量）
-    Start { total: usize },
-    /// 单个 mod 在 mods 目录已存在且 sha1 一致，跳过下载
-    Skipped { filename: String },
-    /// 单个 mod 解析完成（拿到了下载信息），等待进入下载队列
-    Resolved { filename: String },
-    /// 单个 mod 开始下载
-    DownloadStart { filename: String },
-    /// 单个文件的实时下载进度（仅用于展示，每当已下载字节数变化时发出一次）
-    Downloading {
-        filename: String,
-        downloaded: u64,
-        /// 文件总大小，还没拿到 Content-Length 时为 None
-        total: Option<u64>,
-        /// 下载速度，单位为 字节/秒
-        speed: f64,
-    },
-    /// 单个 mod 下载完成
-    Downloaded { filename: String },
-    /// 单个 mod 失败（两个渠道都不可用）
-    Failed { filename: String, message: String },
-    /// 全部完成
-    Done {
-        total: usize,
-        downloaded: usize,
-        skipped: usize,
-        failed: usize,
-    },
-}
-
-/// 反序列化：读取 `<项目>/.rev_launcher/mods/*.toml` 中保存的 [`ModInfo`]，
-/// 在独立线程中把对应的 mod 下载到游戏的 mods 目录。
-///
-/// - 先用多线程并发解析所有 mod 的下载信息（优先 Modrinth，其次 CurseForge），
-///   全部解析完成后才交给 sharingan 下载器并发下载；
-/// - 目标文件已存在且 sha1 一致时跳过下载；
-/// - 下载失败时换另一个渠道重试一次，下载完成后校验文件 sha1。
-///
-/// 返回接收进度的 channel，事件见 [`DeserializeModsProgress`]；
-/// 线程执行中出错时 channel 会先发出 `Err` 再关闭。
-pub fn deserialize_mods(
-    project: &GameProject,
-    threads: usize,
-) -> Result<mpsc::Receiver<Result<DeserializeModsProgress, Error>>, Error> {
-    let toml_dir = detective_path(project).join("mods");
-    let mods = read_mod_infos(&toml_dir)?;
-
+/// 文件读取和创建 mods 目录失败会直接返回 `Err`；平台查询、下载和校验错误记录在
+/// 各任务的 `failed_reason()` 中。查询与下载共用 `threads` 个 Worker（至少一个）。
+/// 优先使用 Modrinth，失败时尝试 CurseForge；下载失败后换渠道重试一次。
+/// 本地文件 SHA-1 一致时跳过，任务成功且 `task.options().skip_download` 为 `true`。
+/// 调用方通过 `tasks()`、`is_finished()` 和 `is_all_success()` 查询进度与结果。
+/// 需要保留返回的下载器直到任务结束；丢弃下载器会取消任务。
+pub fn deserialize_mods(project: &GameProject, threads: usize) -> Result<Downloader, Error> {
+    let mods = read_mod_infos(&detective_path(project).join("mods"))?;
     let mods_dir = project.path.join("mods");
-    let (tx, rx) = mpsc::channel();
-
-    std::thread::spawn(move || {
-        let result = deserialize_mods_in_thread(mods, mods_dir, threads, &tx);
-        if let Err(e) = result {
-            let _ = tx.send(Err(e));
-        }
-    });
-
-    Ok(rx)
+    std::fs::create_dir_all(&mods_dir)?;
+    let mut downloader = DownloadBuilder::new().thread_num(threads.max(1)).build();
+    for info in mods {
+        let path = mods_dir.clone();
+        downloader.download(move |builder| {
+            builder
+                .path(path)
+                .filename(info.filename.clone())
+                .overwrite(true)
+                .before_download(move |options| {
+                    let resolved = resolve_download_info(&info, None)
+                        .map_err(DownloadFailure::PreparationError)?;
+                    let used = resolved.channel;
+                    let mut options = prepare_mod_download(options, resolved);
+                    options.add_fallback(move |options| {
+                        let resolved = resolve_download_info(&info, Some(used))
+                            .map_err(DownloadFailure::PreparationError)?;
+                        Ok(prepare_mod_download(options, resolved))
+                    });
+                    Ok(options)
+                })
+                .build()
+        });
+    }
+    Ok(downloader)
 }
 
 /// 从目录读取所有 toml 文件并反序列化为 [`ModInfo`]，按 filename 排序。
@@ -262,43 +232,17 @@ struct ResolvedDownload {
     channel: DownloadChannel,
 }
 
-/// 解析阶段单个 mod 的结果
-#[derive(Clone)]
-enum ResolvedMod {
-    /// 已存在且哈希一致，跳过
-    Skipped,
-    /// 可以下载
-    Ready(ResolvedDownload),
-    /// 两个渠道都不可用
-    Failed(String),
-}
-
-/// 解析阶段的并发线程数
-const RESOLVE_THREADS: usize = 4;
-
-/// 解析单个 mod：查询渠道下载信息，并检查文件是否已存在可跳过。
-fn resolve_mod(mod_info: &ModInfo, mods_dir: &Path) -> ResolvedMod {
-    match resolve_download_info(mod_info) {
-        Err(message) => ResolvedMod::Failed(message),
-        Ok(resolved) => {
-            let target = mods_dir.join(&mod_info.filename);
-            if target.is_file()
-                && modrinth_sha1(&target).is_ok_and(|sha1| sha1 == resolved.sha1)
-            {
-                ResolvedMod::Skipped
-            } else {
-                ResolvedMod::Ready(resolved)
-            }
-        }
-    }
-}
-
 /// 解析 mod 的下载地址与 sha1：优先 Modrinth，查询失败或信息不全时再用
-/// CurseForge。
-fn resolve_download_info(mod_info: &ModInfo) -> Result<ResolvedDownload, String> {
+/// CurseForge。重试时排除已经使用过的渠道。
+fn resolve_download_info(
+    mod_info: &ModInfo,
+    excluded: Option<DownloadChannel>,
+) -> Result<ResolvedDownload, String> {
     let mut errors: Vec<String> = vec![];
 
-    if let Some(mr) = &mod_info.modrinth {
+    if let Some(mr) = &mod_info.modrinth
+        && excluded != Some(DownloadChannel::Modrinth)
+    {
         match find_modrinth_version_with_rev_ua(&mr.id) {
             Ok(version) => match primary_version_file(&version) {
                 Some((url, sha1)) => {
@@ -314,7 +258,9 @@ fn resolve_download_info(mod_info: &ModInfo) -> Result<ResolvedDownload, String>
         }
     }
 
-    if let Some(cf) = &mod_info.curseforge {
+    if let Some(cf) = &mod_info.curseforge
+        && excluded != Some(DownloadChannel::Curseforge)
+    {
         match find_curse_file_info_with_rev_ua(cf.project_id, cf.file_id) {
             Ok(info) => {
                 if info.download_url.is_empty() {
@@ -339,35 +285,6 @@ fn resolve_download_info(mod_info: &ModInfo) -> Result<ResolvedDownload, String>
     Err(errors.join("；"))
 }
 
-/// 解析另一个渠道的下载信息（下载失败时的备选渠道）。
-fn resolve_other_channel(mod_info: &ModInfo, used: DownloadChannel) -> Option<ResolvedDownload> {
-    match used {
-        DownloadChannel::Curseforge => mod_info.modrinth.as_ref().and_then(|mr| {
-            find_modrinth_version_with_rev_ua(&mr.id)
-                .ok()
-                .and_then(|version| primary_version_file(&version))
-                .map(|(url, sha1)| ResolvedDownload {
-                    url,
-                    sha1,
-                    channel: DownloadChannel::Modrinth,
-                })
-        }),
-        DownloadChannel::Modrinth => mod_info.curseforge.as_ref().and_then(|cf| {
-            find_curse_file_info_with_rev_ua(cf.project_id, cf.file_id)
-                .ok()
-                .filter(|info| !info.download_url.is_empty())
-                .and_then(|info| {
-                    let sha1 = info.sha1().map(|sha1| sha1.to_string())?;
-                    Some(ResolvedDownload {
-                        url: info.download_url,
-                        sha1,
-                        channel: DownloadChannel::Curseforge,
-                    })
-                })
-        }),
-    }
-}
-
 /// 取 Modrinth version 的 primary 文件（没有则取第一个），返回 (url, sha1)。
 fn primary_version_file(version: &ModrinthVersion) -> Option<(String, String)> {
     let file = version
@@ -381,230 +298,22 @@ fn primary_version_file(version: &ModrinthVersion) -> Option<(String, String)> {
     Some((file.url.clone(), file.hashes.sha1.clone()))
 }
 
-/// 向下载器提交一个下载任务，完成后用 sha1 校验文件完整性。
-fn submit_download(
-    downloader: &mut Downloader,
-    task_id: usize,
-    mods_dir: &Path,
-    resolved: &ResolvedDownload,
-    filename: &str,
-) {
-    let expected_sha1 = resolved.sha1.clone();
-    let task = TaskBuilder::new(task_id)
-        .url(resolved.url.clone())
-        .path(mods_dir.to_path_buf())
-        .filename(filename.to_string())
-        .overwrite(true)
-        .validator(move |path| {
-            if modrinth_sha1(&path).is_ok_and(|sha1| sha1 == expected_sha1) {
-                Ok(())
-            } else {
-                Err(DownloadFailure::ValidationError)
-            }
-        })
-        .build();
-    downloader.add_task(task);
-}
-
-/// 线程内的实际下载流程
-fn deserialize_mods_in_thread(
-    mods: Vec<ModInfo>,
-    mods_dir: PathBuf,
-    threads: usize,
-    tx: &Sender<Result<DeserializeModsProgress, Error>>,
-) -> Result<usize, Error> {
-    // 接收端被丢弃时 send 会失败，忽略即可（下载仍会继续）
-    let send = |event: DeserializeModsProgress| {
-        let _ = tx.send(Ok(event));
-    };
-
-    let total = mods.len();
-    send(DeserializeModsProgress::Start { total });
-
-    std::fs::create_dir_all(&mods_dir)?;
-
-    // 任务 id -> mod 下标；mod 下标 -> 解析时使用的渠道
-    let mut task_mods: HashMap<usize, usize> = HashMap::new();
-    let mut channels: Vec<Option<DownloadChannel>> = vec![None; total];
-    let mut next_task_id = 0usize;
-
-    let (mut downloaded, mut skipped, mut failed) = (0usize, 0usize, 0usize);
-
-    // 解析阶段：多线程并发查询每个 mod 的下载信息（含跳过检查），
-    // 解析线程直接发出 Resolved / Skipped / Failed 事件
-    let outcomes: Vec<ResolvedMod> = if mods.is_empty() {
-        vec![]
-    } else {
-        std::thread::scope(|scope| {
-            let resolve_threads = RESOLVE_THREADS.min(total);
-            let chunk_size = total.div_ceil(resolve_threads);
-            let mods_dir = &mods_dir;
-
-            let mut handles = vec![];
-            for (chunk_idx, chunk) in mods.chunks(chunk_size).enumerate() {
-                let start = chunk_idx * chunk_size;
-                let tx = tx.clone();
-                handles.push((
-                    start,
-                    scope.spawn(move || {
-                        let send = |event: DeserializeModsProgress| {
-                            let _ = tx.send(Ok(event));
-                        };
-                        chunk
-                            .iter()
-                            .map(|mod_info| {
-                                let outcome = resolve_mod(mod_info, &mods_dir);
-                                match &outcome {
-                                    ResolvedMod::Failed(message) => send(
-                                        DeserializeModsProgress::Failed {
-                                            filename: mod_info.filename.clone(),
-                                            message: message.clone(),
-                                        },
-                                    ),
-                                    ResolvedMod::Skipped => send(
-                                        DeserializeModsProgress::Skipped {
-                                            filename: mod_info.filename.clone(),
-                                        },
-                                    ),
-                                    ResolvedMod::Ready(_) => send(
-                                        DeserializeModsProgress::Resolved {
-                                            filename: mod_info.filename.clone(),
-                                        },
-                                    ),
-                                }
-                                outcome
-                            })
-                            .collect::<Vec<_>>()
-                    }),
-                ));
-            }
-
-            let mut outcomes: Vec<Option<ResolvedMod>> = vec![None; total];
-            for (start, handle) in handles {
-                for (offset, outcome) in handle
-                    .join()
-                    .expect("解析线程不应 panic")
-                    .into_iter()
-                    .enumerate()
-                {
-                    outcomes[start + offset] = Some(outcome);
-                }
-            }
-            outcomes.into_iter().map(Option::unwrap).collect()
-        })
-    };
-
-    // 提交阶段：解析全部完成后，把可以下载的 mod 一次性交给下载器
-    let mut downloader = DownloadBuilder::default().thread_num(threads).build();
-    for (index, mod_info) in mods.iter().enumerate() {
-        match &outcomes[index] {
-            ResolvedMod::Failed(_) => failed += 1, // 事件已在解析线程发出
-            ResolvedMod::Skipped => skipped += 1,
-            ResolvedMod::Ready(resolved) => {
-                channels[index] = Some(resolved.channel);
-                send(DeserializeModsProgress::DownloadStart {
-                    filename: mod_info.filename.clone(),
-                });
-                submit_download(
-                    &mut downloader,
-                    next_task_id,
-                    &mods_dir,
-                    resolved,
-                    &mod_info.filename,
-                );
-                task_mods.insert(next_task_id, index);
-                next_task_id += 1;
-            }
-        }
-    }
-
-    // 下载阶段：轮询任务状态，单个任务失败时换另一个渠道重试一次
-    let mut handled: HashSet<usize> = HashSet::new();
-    // 上次上报下载进度的字节数，用于去重
-    let mut last_reported: HashMap<usize, u64> = HashMap::new();
-    loop {
-        // 先上报未完成任务的实时下载进度
-        let progress_updates: Vec<DeserializeModsProgress> = downloader
-            .tasks()
-            .iter()
-            .filter(|(id, task)| !handled.contains(id) && !task.status().is_finished())
-            .filter_map(|(id, task)| {
-                let downloaded = task.progress().downloaded();
-                if last_reported.get(id) == Some(&downloaded) {
-                    return None;
-                }
-                last_reported.insert(*id, downloaded);
-                Some(DeserializeModsProgress::Downloading {
-                    filename: mods[task_mods[id]].filename.clone(),
-                    downloaded,
-                    total: task.progress().total(),
-                    speed: task.progress().speed(),
-                })
-            })
-            .collect();
-        for event in progress_updates {
-            send(event);
-        }
-
-        let finished: Vec<(usize, DownloadStatus)> = downloader
-            .tasks()
-            .iter()
-            .filter(|(id, task)| !handled.contains(id) && task.status().is_finished())
-            .map(|(id, task)| (*id, task.status()))
-            .collect();
-
-        for (id, status) in finished {
-            handled.insert(id);
-            let index = task_mods[&id];
-            let mod_info = &mods[index];
-            let filename = mod_info.filename.clone();
-
-            if status.is_success() {
-                downloaded += 1;
-                send(DeserializeModsProgress::Downloaded { filename });
-                continue;
-            }
-
-            let used = channels[index].expect("提交过下载任务的 mod 一定记录了渠道");
-            match resolve_other_channel(mod_info, used) {
-                Some(resolved) => {
-                    channels[index] = Some(resolved.channel);
-                    send(DeserializeModsProgress::DownloadStart {
-                        filename: filename.clone(),
-                    });
-                    submit_download(
-                        &mut downloader,
-                        next_task_id,
-                        &mods_dir,
-                        &resolved,
-                        &filename,
-                    );
-                    task_mods.insert(next_task_id, index);
-                    next_task_id += 1;
-                }
-                None => {
-                    failed += 1;
-                    send(DeserializeModsProgress::Failed {
-                        filename,
-                        message: "下载失败，且没有其他渠道可用".to_string(),
-                    });
-                }
-            }
-        }
-
-        if downloader.tasks().keys().all(|id| handled.contains(id)) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    send(DeserializeModsProgress::Done {
-        total,
-        downloaded,
-        skipped,
-        failed,
+/// 下载地址和校验规则都由前置回调确定；本地文件正确时直接跳过。
+fn prepare_mod_download(
+    mut options: DownloadOptions,
+    resolved: ResolvedDownload,
+) -> DownloadOptions {
+    options.url = resolved.url;
+    let expected_sha1 = resolved.sha1;
+    let validator = Arc::new(move |path: PathBuf| match modrinth_sha1(&path) {
+        Ok(sha1) if sha1 == expected_sha1 => Ok(()),
+        Err(Error::Io(error)) => Err(DownloadFailure::IOError(error)),
+        _ => Err(DownloadFailure::ValidationError),
     });
-    Ok(total)
+    let target = options.path.join(&options.filename);
+    options.skip_download = target.is_file() && validator(target).is_ok();
+    options.validator = Some(validator);
+    options
 }
 
 /// 列出目录下所有 jar 文件（扩展名不区分大小写），按路径排序。
@@ -632,14 +341,157 @@ fn list_jars(dir: &Path) -> Result<Vec<PathBuf>, Error> {
 
 #[cfg(test)]
 mod tests {
+    use super::SerializeModsProgress;
+    use super::deserialize_mods;
     use super::list_jars;
     use super::read_mod_infos;
     use super::serialize_mods;
-    use super::deserialize_mods;
-    use super::SerializeModsProgress;
-    use super::DeserializeModsProgress;
+    use super::{DownloadChannel, ResolvedDownload, prepare_mod_download, resolve_download_info};
     use crate::detective::mod_info::{CurseforgeInfo, ModInfo, ModrinthInfo};
     use crate::project::game_project::{GameProject, ModLoader};
+    use sharingan::status::DownloadFailure;
+    use sharingan::task::DownloadOptions;
+
+    fn test_project(path: &std::path::Path) -> GameProject {
+        GameProject {
+            name: "test".into(),
+            version: "".into(),
+            path: path.to_path_buf(),
+            game_version: "1.21".into(),
+            loader: ModLoader::Minecraft,
+            loader_version: "1.21".into(),
+        }
+    }
+
+    #[test]
+    fn deserialize_mods_returns_tasks_with_failures_and_zero_threads() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = test_project(directory.path());
+        let metadata = directory.path().join(".rev_launcher/mods");
+        std::fs::create_dir_all(&metadata).unwrap();
+        for filename in ["a.jar", "b.jar"] {
+            let info = ModInfo {
+                filename: filename.into(),
+                curseforge: None,
+                modrinth: None,
+            };
+            std::fs::write(
+                metadata.join(format!("{filename}.toml")),
+                toml_edit::ser::to_string_pretty(&info).unwrap(),
+            )
+            .unwrap();
+        }
+        let mut downloader = deserialize_mods(&project, 0).unwrap();
+        assert_eq!(downloader.thread_num, 1);
+        assert_eq!(downloader.tasks().len(), 2);
+        // 返回的是可继续使用的原始下载器，新增任务 id 不会与 mod 任务冲突。
+        downloader.download(|builder| {
+            builder
+                .filename("extra.jar".into())
+                .before_download(|mut options| {
+                    options.skip_download = true;
+                    Ok(options)
+                })
+                .build()
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !downloader.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "任务结束超时");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(downloader.tasks().len(), 3);
+        for id in 0..2 {
+            let task = &downloader.tasks()[&id];
+            assert!(task.status().is_failed());
+            assert!(
+                matches!(&*task.failed_reason(), DownloadFailure::PreparationError(message)
+                if message.contains("没有可用的下载渠道"))
+            );
+        }
+        assert!(downloader.tasks()[&2].status().is_success());
+        assert!(!downloader.is_all_success());
+    }
+
+    #[test]
+    fn deserialize_mods_reports_setup_errors_directly() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = test_project(directory.path());
+        let metadata = directory.path().join(".rev_launcher/mods");
+        std::fs::create_dir_all(&metadata).unwrap();
+        std::fs::write(metadata.join("invalid.toml"), "[invalid").unwrap();
+        assert!(matches!(
+            deserialize_mods(&project, 1),
+            Err(super::Error::Deserialize { .. })
+        ));
+        std::fs::remove_file(metadata.join("invalid.toml")).unwrap();
+        std::fs::write(directory.path().join("mods"), "not a directory").unwrap();
+        assert!(matches!(
+            deserialize_mods(&project, 1),
+            Err(super::Error::Io(_))
+        ));
+    }
+
+    #[test]
+    fn prepared_mod_skips_only_matching_file_and_validates_downloaded_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("cached.jar");
+        let content = b"correct mod";
+        let resolved = ResolvedDownload {
+            url: "http://unused.invalid/mod.jar".into(),
+            sha1: crate::detective::modrinth::modrinth_sha1_bytes(content),
+            channel: DownloadChannel::Modrinth,
+        };
+        let initial = DownloadOptions {
+            path: directory.path().to_path_buf(),
+            filename: "cached.jar".into(),
+            ..DownloadOptions::default()
+        };
+        assert!(!prepare_mod_download(initial.clone(), resolved.clone()).skip_download);
+        std::fs::write(&target, content).unwrap();
+        let prepared = prepare_mod_download(initial.clone(), resolved.clone());
+        assert!(prepared.skip_download);
+        assert_eq!(prepared.url, resolved.url);
+        let validator = prepared.validator.unwrap();
+        validator(target.clone()).unwrap();
+
+        std::fs::write(&target, b"corrupt").unwrap();
+        assert!(!prepare_mod_download(initial, resolved).skip_download);
+        assert!(matches!(
+            validator(target),
+            Err(DownloadFailure::ValidationError)
+        ));
+        assert!(matches!(
+            validator(directory.path().join("missing.jar")),
+            Err(DownloadFailure::IOError(_))
+        ));
+    }
+
+    #[test]
+    fn retry_excludes_the_used_channel() {
+        let info = ModInfo {
+            filename: "mod.jar".into(),
+            curseforge: None,
+            modrinth: Some(ModrinthInfo {
+                id: "must-not-be-queried".into(),
+            }),
+        };
+        assert!(
+            matches!(resolve_download_info(&info, Some(DownloadChannel::Modrinth)),
+            Err(message) if message == "没有可用的下载渠道")
+        );
+        let info = ModInfo {
+            filename: "mod.jar".into(),
+            modrinth: None,
+            curseforge: Some(CurseforgeInfo {
+                project_id: 0,
+                file_id: 0,
+            }),
+        };
+        assert!(
+            matches!(resolve_download_info(&info, Some(DownloadChannel::Curseforge)),
+            Err(message) if message == "没有可用的下载渠道")
+        );
+    }
 
     #[test]
     fn list_jars_test() {
@@ -712,11 +564,17 @@ mod tests {
         let events: Vec<_> = rx.into_iter().collect();
 
         assert!(
-            matches!(events.first(), Some(Ok(SerializeModsProgress::WriteStart { total: 0 }))),
+            matches!(
+                events.first(),
+                Some(Ok(SerializeModsProgress::WriteStart { total: 0 }))
+            ),
             "events: {events:?}"
         );
         assert!(
-            matches!(events.last(), Some(Ok(SerializeModsProgress::Done { total: 0 }))),
+            matches!(
+                events.last(),
+                Some(Ok(SerializeModsProgress::Done { total: 0 }))
+            ),
             "events: {events:?}"
         );
         assert_eq!(events.len(), 2);
@@ -761,38 +619,13 @@ mod tests {
         assert!(infos[1].modrinth.is_none());
     }
 
-    /// 没有 toml 时线程只发 Start{0} 和 Done{0,0,0,0}，不触发网络请求
+    /// 没有 toml 时返回空下载器，不触发网络请求。
     #[test]
-    fn deserialize_mods_progress_empty_test() {
+    fn deserialize_mods_empty_downloader_test() {
         let dir = tempfile::tempdir().unwrap();
-        let project = GameProject {
-            name: "test".to_string(),
-            version: "".to_string(),
-            path: dir.path().to_path_buf(),
-            game_version: "1.21".to_string(),
-            loader: ModLoader::Minecraft,
-            loader_version: "1.21".to_string(),
-        };
-
-        let rx = deserialize_mods(&project, 10).unwrap();
-        let events: Vec<_> = rx.into_iter().collect();
-
-        assert!(
-            matches!(events.first(), Some(Ok(DeserializeModsProgress::Start { total: 0 }))),
-            "events: {events:?}"
-        );
-        assert!(
-            matches!(
-                events.last(),
-                Some(Ok(DeserializeModsProgress::Done {
-                    total: 0,
-                    downloaded: 0,
-                    skipped: 0,
-                    failed: 0
-                }))
-            ),
-            "events: {events:?}"
-        );
-        assert_eq!(events.len(), 2);
+        let downloader = deserialize_mods(&test_project(dir.path()), 10).unwrap();
+        assert!(downloader.tasks().is_empty());
+        assert!(downloader.is_finished());
+        assert!(downloader.is_all_success());
     }
 }
