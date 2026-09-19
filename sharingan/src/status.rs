@@ -34,6 +34,8 @@ pub enum DownloadStatus {
     Succeeded,
     /// 下载失败，失败原因见 [`DownloadFailure`]。
     Failed,
+    /// 正在执行下载前置回调，尚未发起下载请求。
+    Preparing,
 }
 
 impl DownloadStatus {
@@ -76,6 +78,8 @@ impl DownloadStatus {
 /// [`Task::change_failure()`](crate::task::Task::change_failure) 记录到任务中。
 #[derive(Debug)]
 pub enum DownloadFailure {
+    /// 下载前置回调失败。
+    PreparationError(String),
     /// 用户主动取消。
     UserCancel,
     /// 网络请求失败（连接失败、超时、TLS 错误等）。

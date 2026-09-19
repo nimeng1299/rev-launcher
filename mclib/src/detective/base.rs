@@ -4,7 +4,7 @@ use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
 
 use sharingan::downloader::{DownloadBuilder, Downloader};
-use sharingan::status::DownloadStatus;
+use sharingan::status::{DownloadFailure, DownloadStatus};
 use sharingan::task::TaskBuilder;
 
 use crate::detective::curseforge::{
@@ -395,7 +395,13 @@ fn submit_download(
         .path(mods_dir.to_path_buf())
         .filename(filename.to_string())
         .overwrite(true)
-        .validator(move |path| modrinth_sha1(&path).is_ok_and(|sha1| sha1 == expected_sha1))
+        .validator(move |path| {
+            if modrinth_sha1(&path).is_ok_and(|sha1| sha1 == expected_sha1) {
+                Ok(())
+            } else {
+                Err(DownloadFailure::ValidationError)
+            }
+        })
         .build();
     downloader.add_task(task);
 }

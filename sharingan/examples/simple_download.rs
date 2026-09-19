@@ -1,5 +1,6 @@
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use sharingan::downloader::DownloadBuilder;
+use sharingan::status::DownloadFailure;
 use std::time::Duration;
 
 fn simplify_size(size: u64) -> String {
@@ -60,14 +61,24 @@ fn main() {
 
     downloader.download(|builder| {
         builder
-            .url("https://testfile.to/dl/10mb".to_string())
-            .path(std::env::current_dir().unwrap().join("test"))
+            .before_download(|mut options| {
+                // 在 Worker 中执行，也可以在这里请求接口获取下载信息
+                options.url = "https://testfile.to/dl/10mb".to_string();
+                options.path = std::env::current_dir()
+                    .map_err(DownloadFailure::IOError)?
+                    .join("test");
+
+                options.filename = "file.bin".into();
+                Ok(options)
+            })
             .filename("test10mb.bin".to_string())
             .overwrite(true)
             .validator(|path| {
-                std::fs::metadata(&path)
-                    .map(|metadata| metadata.len() > u64::MAX)
-                    .unwrap_or(false)
+                let metadata = std::fs::metadata(path).map_err(DownloadFailure::IOError)?;
+                if metadata.len() == 0 {
+                    return Err(DownloadFailure::ValidationError);
+                }
+                Ok(())
             })
             .build()
     });
@@ -81,9 +92,11 @@ fn main() {
                 .filename(format!("test{}.bin", i))
                 .overwrite(true)
                 .validator(move |path| {
-                    std::fs::metadata(&path)
-                        .map(|metadata| metadata.len() > min_len)
-                        .unwrap_or(false)
+                    let metadata = std::fs::metadata(path).map_err(DownloadFailure::IOError)?;
+                    if metadata.len() <= min_len {
+                        return Err(DownloadFailure::ValidationError);
+                    }
+                    Ok(())
                 })
                 .build()
         });
@@ -110,6 +123,8 @@ fn main() {
                     speed_size(p.speed()),
                     task.filename()
                 ));
+            } else if status.is_failed() {
+                pb.finish_with_message(format!("failed: {:?}", task.failed_reason()));
             } else {
                 pb.finish_with_message("done");
             }

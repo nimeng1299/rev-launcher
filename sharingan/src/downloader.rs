@@ -118,6 +118,8 @@ impl Downloader {
     /// 闭包 `task_builder` 接收一个 [`TaskBuilder`] 并返回配置完成的
     /// [`Task`]；任务 id 由调度器自动分配。任务提交后会被 Worker 线程
     /// 自动领取下载。
+    /// 此闭包在提交线程立即执行；耗时前置工作应放入
+    /// [`TaskBuilder::before_download`]，由 Worker 并发执行。
     ///
     /// # 示例
     ///
@@ -139,7 +141,7 @@ impl Downloader {
     /// ```
     pub fn download<F>(&mut self, task_builder: F)
     where
-        F: Fn(TaskBuilder) -> Task + 'static,
+        F: FnOnce(TaskBuilder) -> Task + 'static,
     {
         let task = task_builder(TaskBuilder::new(
             self.task_number.fetch_add(1, Ordering::SeqCst),

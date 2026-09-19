@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 use sharingan::downloader::{DownloadBuilder, Downloader};
+use sharingan::status::DownloadFailure;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -342,7 +343,13 @@ pub(super) fn download(
                 .path(parent.clone())
                 .url(artifact.metadata.url.clone().expect("已检查下载地址"))
                 .overwrite(true)
-                .validator(move |path| validator.valid(&path))
+                .validator(move |path| {
+                    if validator.valid(&path) {
+                        Ok(())
+                    } else {
+                        Err(DownloadFailure::ValidationError)
+                    }
+                })
                 .build()
         });
     }
