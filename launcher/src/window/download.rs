@@ -3,11 +3,9 @@
 //! 目前只实现了「原版下载」：从 Mojang 的版本清单拉取所有版本，
 //! 下载后会在设置的版本目录里建一个项目，游戏文件留到首次启动时再拉。
 
-use std::collections::HashSet;
-use std::path::PathBuf;
-
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::Button;
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListItem, ListState};
 use gpui_kit::component::notification::NotificationType;
@@ -21,8 +19,6 @@ use gpui_kit::{
 };
 
 use mclib::project::versions::minecreft::{MinecreftVersions, Version};
-
-use crate::data::settings::AppSettings;
 
 mod dialog;
 use dialog::DownloadDialog;
@@ -67,8 +63,10 @@ enum ManifestStatus {
 /// 靠行号反查会拿错版本。
 struct VersionListDelegate {
     versions: Vec<Version>,
-    /// 已安装的版本 id，列表里会多一个「已下载」标签。
-    installed: HashSet<String>,
+    /// 是否显示正式版。
+    show_release: bool,
+    /// 是否显示快照，旧版 beta/alpha 也归在这一类。
+    show_snapshot: bool,
     /// 搜索框当前的内容，按版本号做子串匹配。
     query: String,
     selected_index: Option<IndexPath>,
@@ -77,13 +75,18 @@ struct VersionListDelegate {
 }
 
 impl VersionListDelegate {
-    /// 按搜索词过滤后的条目，版本号不区分大小写做子串匹配。
+    /// 按类型开关和搜索词过滤后的条目，版本号不区分大小写做子串匹配。
     fn visible_versions(&self) -> Vec<&Version> {
         let query = self.query.trim().to_ascii_lowercase();
         self.versions
             .iter()
             .filter(|version| {
-                query.is_empty() || version.id.to_ascii_lowercase().contains(&query)
+                let shown = match version._type.as_str() {
+                    "release" => self.show_release,
+                    // snapshot、old_beta、old_alpha 都算快照一类。
+                    _ => self.show_snapshot,
+                };
+                shown && (query.is_empty() || version.id.to_ascii_lowercase().contains(&query))
             })
             .collect()
     }
@@ -111,6 +114,7 @@ impl ListDelegate for VersionListDelegate {
     ) -> Task<()> {
         self.query = query.to_owned();
         self.selected_index = None;
+        self.selected_version = None;
         cx.notify();
         Task::ready(())
     }
@@ -128,7 +132,6 @@ impl ListDelegate for VersionListDelegate {
         let visible = self.visible_versions();
         // `get` 拿到的是 `&&Version`，要解引用再 clone 才是 owned 的 `Version`。
         let version = (*visible.get(ix.row)?).clone();
-        let installed = self.installed.contains(&version.id);
 
         Some(
             ListItem::new(ix)
@@ -136,7 +139,7 @@ impl ListDelegate for VersionListDelegate {
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.delegate_mut().set_selected_index(Some(ix), window, cx);
                 }))
-                .child(version_row(&version, installed)),
+                .child(version_row(&version)),
         )
     }
 
@@ -173,17 +176,14 @@ impl ListDelegate for VersionListDelegate {
     }
 }
 
-/// 列表里的一行：版本号 + 类型标签 + 发布时间 + 已下载标记。
-fn version_row(version: &Version, installed: bool) -> AnyElement {
+/// 列表里的一行：版本号 + 类型标签 + 发布时间。
+fn version_row(version: &Version) -> AnyElement {
     let mut tags = h_flex().flex_none().items_center().gap_1();
     tags = tags.child(version_type_tag(&version._type));
     // `releaseTime` 是 RFC3339，列表里只留日期部分。
     let release_date = version.release_time.split('T').next().unwrap_or_default();
     if !release_date.is_empty() {
         tags = tags.child(Tag::secondary().outline().child(release_date.to_owned()));
-    }
-    if installed {
-        tags = tags.child(Tag::info().child("已下载"));
     }
 
     h_flex()
@@ -203,17 +203,6 @@ fn version_row(version: &Version, installed: bool) -> AnyElement {
         .into_any_element()
 }
 
-/// 扫一遍设置里的所有版本目录，返回已安装项目的游戏版本集合。
-fn installed_versions(paths: &[PathBuf]) -> HashSet<String> {
-    use mclib::project::game_project::find_all_game_in_project_folder;
-
-    paths
-        .iter()
-        .flat_map(find_all_game_in_project_folder)
-        .map(|project| project.game_version)
-        .collect()
-}
-
 pub struct DownloadPage {
     /// 当前选中的侧边栏项。
     section: DownloadSection,
@@ -231,7 +220,8 @@ impl DownloadPage {
             ListState::new(
                 VersionListDelegate {
                     versions: Vec::new(),
-                    installed: HashSet::new(),
+                    show_release: true,
+                    show_snapshot: false,
                     query: String::new(),
                     selected_index: None,
                     selected_version: None,
@@ -276,10 +266,13 @@ impl DownloadPage {
                             Some((manifest.latest.release.clone(), manifest.latest.snapshot));
                         page.manifest_status = ManifestStatus::Ready;
                         page.version_list.update(cx, |state, cx| {
-                            state.delegate_mut().versions = manifest.versions;
+                            let delegate = state.delegate_mut();
+                            delegate.versions = manifest.versions;
+                            // 清单重新拉过，选中项的版本对象可能已经不是同一个了。
+                            delegate.selected_index = None;
+                            delegate.selected_version = None;
                             cx.notify();
                         });
-                        page.refresh_installed(cx);
                     }
                     Err(error) => {
                         page.manifest_status = ManifestStatus::Failed(error.to_string());
@@ -291,19 +284,26 @@ impl DownloadPage {
         .detach();
     }
 
-    /// 重新扫描版本目录，把已安装的版本同步进列表的「已下载」状态。
-    fn refresh_installed(&mut self, cx: &mut Context<Self>) {
-        let installed = installed_versions(&cx.global::<AppSettings>().project_paths);
-        self.version_list.update(cx, |state, cx| {
-            state.delegate_mut().installed = installed;
-            cx.notify();
-        });
+    /// 刷新按钮：重新拉版本清单。
+    fn refresh_versions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.load_versions(window, cx);
     }
 
-    /// 刷新按钮：重新拉版本清单；就算网络挂了也先刷新一遍「已下载」状态。
-    fn refresh_versions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.refresh_installed(cx);
-        self.load_versions(window, cx);
+    /// 类型筛选开关变化时刷新列表，并清掉可能被过滤掉的选中项。
+    fn set_show_kind(&mut self, release: Option<bool>, snapshot: Option<bool>, cx: &mut Context<Self>) {
+        self.version_list.update(cx, |state, cx| {
+            let delegate = state.delegate_mut();
+            if let Some(value) = release {
+                delegate.show_release = value;
+            }
+            if let Some(value) = snapshot {
+                delegate.show_snapshot = value;
+            }
+            // 选中项可能被筛掉，直接清掉免得「下载」按钮对着看不见的版本。
+            delegate.selected_index = None;
+            delegate.selected_version = None;
+            cx.notify();
+        });
     }
 
     /// 点「下载」：对当前选中的版本弹出下载对话框。
@@ -326,8 +326,7 @@ impl DownloadPage {
             return;
         };
 
-        let page = cx.entity().downgrade();
-        let dialog = cx.new(|cx| DownloadDialog::new(version, page, window, cx));
+        let dialog = cx.new(|cx| DownloadDialog::new(version, window, cx));
         DownloadDialog::open(dialog, window, cx);
     }
 
@@ -401,14 +400,35 @@ impl DownloadPage {
                 )
                 .into_any_element(),
             ManifestStatus::Ready => {
+                let delegate = self.version_list.read(cx).delegate();
+                let show_release = delegate.show_release;
+                let show_snapshot = delegate.show_snapshot;
+
                 let mut toolbar = h_flex().w_full().items_center().gap_2();
                 if let Some((release, snapshot)) = &self.latest {
+                    // 和列表里的版本类型标签用同一套颜色。
                     toolbar = toolbar
-                        .child(Tag::info().child(format!("最新正式版 {release}")))
-                        .child(Tag::secondary().outline().child(format!("最新快照 {snapshot}")));
+                        .child(Tag::success().child(format!("最新正式版 {release}")))
+                        .child(Tag::warning().child(format!("最新快照 {snapshot}")));
                 }
                 toolbar = toolbar
                     .child(div().flex_1())
+                    .child(
+                        Checkbox::new("filter-release")
+                            .label("正式版")
+                            .checked(show_release)
+                            .on_click(cx.listener(|this, checked, _, cx| {
+                                this.set_show_kind(Some(*checked), None, cx);
+                            })),
+                    )
+                    .child(
+                        Checkbox::new("filter-snapshot")
+                            .label("快照")
+                            .checked(show_snapshot)
+                            .on_click(cx.listener(|this, checked, _, cx| {
+                                this.set_show_kind(None, Some(*checked), cx);
+                            })),
+                    )
                     .child(
                         Button::new("refresh-versions")
                             .icon(IconName::RotateCw)

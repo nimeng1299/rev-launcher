@@ -21,7 +21,7 @@ use gpui_kit::component::searchable_list::SearchableListItem;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, Styled, Subscription, WeakEntity, Window, div, px,
+    Render, SharedString, Styled, Subscription, Window, div, px,
 };
 use rfd::AsyncFileDialog;
 
@@ -30,8 +30,6 @@ use mclib::project::versions::minecreft::Version;
 
 use crate::data::app_data::ProjectsRevision;
 use crate::data::settings::AppSettings;
-
-use super::DownloadPage;
 
 const INSTALL_STEPS: [&str; 3] = ["下载版本清单", "下载运行文件", "写入项目文件"];
 
@@ -181,8 +179,6 @@ pub(super) struct DownloadDialog {
     error: Arc<Mutex<Option<String>>>,
     /// 下载成功后创建出来的项目名，结果页展示用。
     installed_name: Option<String>,
-    /// 页面的弱引用，下载完成后同步列表的「已下载」状态。
-    page: WeakEntity<DownloadPage>,
     focus_handle: FocusHandle,
     _dir_subscription: Subscription,
 }
@@ -190,7 +186,6 @@ pub(super) struct DownloadDialog {
 impl DownloadDialog {
     pub(super) fn new(
         version: Version,
-        page: WeakEntity<DownloadPage>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -291,7 +286,6 @@ impl DownloadDialog {
             progress: None,
             error: Arc::new(Mutex::new(None)),
             installed_name: None,
-            page,
             focus_handle: cx.focus_handle(),
             _dir_subscription: dir_subscription,
         }
@@ -373,7 +367,6 @@ impl DownloadDialog {
         self.progress = Some(progress.clone());
 
         // 轮询安装状态：映射到步骤下标并刷新界面，结束后写入结果。
-        let page = self.page.clone();
         cx.spawn_in(_window, async move |view, cx| {
             loop {
                 cx.background_executor()
@@ -398,7 +391,6 @@ impl DownloadDialog {
                                 }
                                 // 磁盘上多了一个项目，让启动页/VCS 页/版本管理页重扫。
                                 cx.global_mut::<ProjectsRevision>().bump();
-                                let _ = page.update(cx, |page, cx| page.refresh_installed(cx));
                                 cx.notify();
                                 return false;
                             }
@@ -418,7 +410,6 @@ impl DownloadDialog {
                                 }
                                 *dialog.status.lock().unwrap_or_else(|e| e.into_inner()) =
                                     Some(InstallStatus::Failed(step));
-                                let _ = page.update(cx, |page, cx| page.refresh_installed(cx));
                                 cx.notify();
                                 return false;
                             }
