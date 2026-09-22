@@ -15,6 +15,7 @@ use gpui_kit::{
 
 use mclib::project::game_project::{GameProject, ModLoader, find_all_game_in_project_folder};
 
+use crate::data::app_data::ProjectsRevision;
 use crate::data::settings::AppSettings;
 
 /// 版本管理页向主窗口发出的跳转请求。
@@ -228,6 +229,8 @@ pub struct VersionControlPage {
     path_options: Vec<PathBuf>,
     /// 当前选中的路径，默认取设置里的第一个。
     selected_path: Option<PathBuf>,
+    /// 上次同步时的项目列表修订号，别处新建/删除项目后会 +1。
+    known_revision: u64,
 }
 
 impl VersionControlPage {
@@ -296,6 +299,7 @@ impl VersionControlPage {
             _select_subscription,
             path_options: paths,
             selected_path,
+            known_revision: cx.global::<ProjectsRevision>().get(),
         }
     }
 
@@ -333,11 +337,18 @@ impl VersionControlPage {
     /// 放在渲染期做，是为了不额外维护一套「设置变了」的通知。
     fn sync_paths(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let paths: Vec<PathBuf> = cx.global::<AppSettings>().project_paths.clone();
+        let revision = cx.global::<ProjectsRevision>().get();
 
         if paths == self.path_options {
+            if revision != self.known_revision {
+                // 路径没变但磁盘上的项目有增删（比如下载页装了新版本），重扫一遍。
+                self.known_revision = revision;
+                self.reload_projects(cx);
+            }
             return;
         }
 
+        self.known_revision = revision;
         self.path_options = paths;
 
         // 原来选中的路径没了（比如在设置里删掉了）就退回第一个。

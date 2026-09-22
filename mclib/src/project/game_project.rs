@@ -124,7 +124,11 @@ fn read_from_json_file(path_buf: &PathBuf) -> Result<GameProject, crate::error::
     let data: Value = from_str(&contents).or_else(|e| Err(crate::error::Error::Json(e)))?;
 
     // 通过patches来判断版本，所有未判断出来的统一为原版
-    let lib = json_get_patches(&data)?;
+    // 原版清单没有 patches 数组，视为空列表
+    let lib = match data.get("patches") {
+        Some(_) => json_get_patches(&data)?,
+        None => Vec::new(),
+    };
     let mut game_version = None;
     let mut loader = ModLoader::Minecraft;
     let mut loader_version = None;
@@ -161,6 +165,13 @@ fn read_from_json_file(path_buf: &PathBuf) -> Result<GameProject, crate::error::
             }
         }
     }
+
+    // 原版清单没有 patches，直接用 JSON 的 id 字段作为游戏版本
+    let game_version = game_version.or_else(|| {
+        data.get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
 
     if let Some(game_version) = game_version {
         if loader == ModLoader::Minecraft {

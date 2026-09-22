@@ -17,6 +17,7 @@ use gpui_kit::{
 
 use mclib::project::game_project::{GameProject, ModLoader, find_all_game_in_project_folder};
 
+use crate::data::app_data::ProjectsRevision;
 use crate::data::settings::AppSettings;
 
 /// 扫一遍设置里的所有版本目录，拿到全部项目。
@@ -220,6 +221,8 @@ pub struct ProjectSelect {
     known_paths: Vec<PathBuf>,
     /// 上次同步时设置里的当前项目。
     known_selection: Option<PathBuf>,
+    /// 上次同步时的项目列表修订号，别处新建/删除项目后会 +1。
+    known_revision: u64,
 }
 
 impl ProjectSelect {
@@ -246,6 +249,7 @@ impl ProjectSelect {
             selected_path: selected.clone(),
             known_paths: paths,
             known_selection: selected,
+            known_revision: cx.global::<ProjectsRevision>().get(),
         }
     }
 
@@ -257,15 +261,20 @@ impl ProjectSelect {
     pub fn sync(&mut self, window: &mut Window, cx: &mut App) -> bool {
         let paths = cx.global::<AppSettings>().project_paths.clone();
         let settings_selection = cx.global::<AppSettings>().select_project_path.clone();
+        let revision = cx.global::<ProjectsRevision>().get();
 
-        if paths == self.known_paths && settings_selection == self.known_selection {
+        if paths == self.known_paths
+            && settings_selection == self.known_selection
+            && revision == self.known_revision
+        {
             return false;
         }
 
-        if paths != self.known_paths {
+        if paths != self.known_paths || revision != self.known_revision {
             self.known_paths = paths.clone();
             self.projects = detect_projects(&paths);
         }
+        self.known_revision = revision;
 
         // 设置里指定的项目优先，它没了就沿用原来的选择，再不行取第一个。
         let selected = resolve_selection(

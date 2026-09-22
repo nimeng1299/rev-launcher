@@ -1,5 +1,5 @@
 use crate::data::account_data::AccountData;
-use crate::data::app_data::AppData;
+use crate::data::app_data::{AppData, ProjectsRevision};
 use crate::data::settings::AppSettings;
 use crate::window::main_window::MainWindow;
 use gpui_kit::component::{Root, Theme, ThemeMode, TitleBar};
@@ -41,6 +41,7 @@ pub fn run_app() {
         app.set_global(AccountData::init());
         app.set_global(AppData::init());
         app.set_global(AppSettings::init());
+        app.set_global(ProjectsRevision::init());
 
         app.spawn(async move |cx| {
             cx.open_window(options, |window, cx| {
