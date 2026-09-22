@@ -80,7 +80,7 @@ fn loader_name(loader: &ModLoader) -> &'static str {
     }
 }
 
-/// 列表里的一行内容：项目名后面跟着版本标签，跟启动页下拉框的样式一致。
+/// 项目名后面跟着版本标签，跟启动页下拉框的样式一致。
 fn project_row(project: &GameProject) -> AnyElement {
     let mut tags = h_flex().flex_none().items_center().gap_1();
     tags = tags.child(Tag::secondary().child(project.game_version.clone()));

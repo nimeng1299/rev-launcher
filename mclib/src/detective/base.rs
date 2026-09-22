@@ -105,7 +105,7 @@ fn serialize_mods_in_thread(
         let toml_path = out_dir.join(format!("{}.toml", filename));
         if let Ok(content) = std::fs::read_to_string(&toml_path)
             && let Ok(info) = toml_edit::de::from_str::<ModInfo>(&content)
-            && info.sha1.as_deref() == Some(sha1.as_str())
+            && info.sha1 == sha1
         {
             fresh.insert(jar);
             send(SerializeModsProgress::WriteDone {
@@ -157,7 +157,7 @@ fn serialize_mods_in_thread(
 
             let info = ModInfo {
                 filename: filename.to_string(),
-                sha1: sha1_by_jar.get(jar).cloned(),
+                sha1: sha1_by_jar.get(jar).cloned().unwrap_or_default(),
                 curseforge,
                 modrinth,
             };
@@ -406,7 +406,7 @@ mod tests {
         for filename in ["a.jar", "b.jar"] {
             let info = ModInfo {
                 filename: filename.into(),
-                sha1: None,
+                sha1: String::new(),
                 curseforge: None,
                 modrinth: None,
             };
@@ -505,7 +505,7 @@ mod tests {
     fn retry_excludes_the_used_channel() {
         let info = ModInfo {
             filename: "mod.jar".into(),
-            sha1: None,
+            sha1: String::new(),
             curseforge: None,
             modrinth: Some(ModrinthInfo {
                 id: "must-not-be-queried".into(),
@@ -517,7 +517,7 @@ mod tests {
         );
         let info = ModInfo {
             filename: "mod.jar".into(),
-            sha1: None,
+            sha1: String::new(),
             modrinth: None,
             curseforge: Some(CurseforgeInfo {
                 project_id: 0,
@@ -558,7 +558,7 @@ mod tests {
     fn mod_info_toml_format_test() {
         let info = ModInfo {
             filename: "sodium.jar".to_string(),
-            sha1: None,
+            sha1: String::new(),
             curseforge: Some(CurseforgeInfo {
                 project_id: 394468,
                 file_id: 5594023,
@@ -578,7 +578,7 @@ mod tests {
         // 没匹配到信息时只序列化 filename
         let info = ModInfo {
             filename: "unknown.jar".to_string(),
-            sha1: None,
+            sha1: String::new(),
             curseforge: None,
             modrinth: None,
         };
@@ -632,7 +632,7 @@ mod tests {
         let sha1 = crate::detective::modrinth::modrinth_sha1_bytes(b"jar content");
         let info = ModInfo {
             filename: "sodium.jar".into(),
-            sha1: Some(sha1),
+            sha1,
             curseforge: None,
             modrinth: None,
         };
@@ -665,7 +665,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let full = ModInfo {
             filename: "sodium.jar".to_string(),
-            sha1: None,
+            sha1: String::new(),
             curseforge: Some(CurseforgeInfo {
                 project_id: 394468,
                 file_id: 5594023,
@@ -676,7 +676,7 @@ mod tests {
         };
         let only_name = ModInfo {
             filename: "unknown.jar".to_string(),
-            sha1: None,
+            sha1: String::new(),
             curseforge: None,
             modrinth: None,
         };
