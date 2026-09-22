@@ -41,34 +41,83 @@ impl DevelopSection {
     }
 }
 
-/// mods 目录里的一个模组文件。
+/// 项目资源目录里的一个可启停文件（模组、资源包、光影通用）。
 #[derive(Debug, Clone)]
-struct ModEntry {
+struct PackEntry {
     /// 磁盘上的完整路径，切换启用状态时直接对它重命名。
     path: PathBuf,
     /// 文件名，例如 `sodium.jar` 或 `sodium.jar.disabled`。
     file_name: String,
-    /// `true` 表示 `.jar`（启用），`false` 表示 `.jar.disabled`（禁用）。
+    /// `true` 表示启用（`.jar` / `.zip`），`false` 表示禁用（末尾追加 `.disabled`）。
     enabled: bool,
 }
 
-/// 文件名是 `.jar`（启用）或 `.jar.disabled`（禁用）就返回对应状态，其它文件不算模组。
-fn mod_enabled(file_name: &str) -> Option<bool> {
+/// 可以被勾选启停的资源类别，和项目下的目录一一对应。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackKind {
+    /// `mods` 目录，`.jar` 文件。
+    Mod,
+    /// `resourcepacks` 目录，`.zip` 文件。
+    ResourcePack,
+    /// `shaderpacks` 目录，`.zip` 文件。
+    Shader,
+}
+
+impl PackKind {
+    /// 侧边栏项对应的资源类别，「通用」页没有。
+    fn from_section(section: DevelopSection) -> Option<Self> {
+        match section {
+            DevelopSection::Mods => Some(Self::Mod),
+            DevelopSection::ResourcePacks => Some(Self::ResourcePack),
+            DevelopSection::Shaders => Some(Self::Shader),
+            DevelopSection::General => None,
+        }
+    }
+
+    /// 在项目目录下的文件夹名。
+    fn dir_name(self) -> &'static str {
+        match self {
+            Self::Mod => "mods",
+            Self::ResourcePack => "resourcepacks",
+            Self::Shader => "shaderpacks",
+        }
+    }
+
+    /// 启用文件的后缀，禁用态是在末尾再追加 `.disabled`。
+    fn ext(self) -> &'static str {
+        match self {
+            Self::Mod => ".jar",
+            Self::ResourcePack | Self::Shader => ".zip",
+        }
+    }
+
+    /// 界面文案里的叫法。
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Mod => "模组",
+            Self::ResourcePack => "资源包",
+            Self::Shader => "光影",
+        }
+    }
+}
+
+/// 文件名是 `ext`（启用）或 `ext + .disabled`（禁用）就返回对应状态，其它文件不算数。
+fn pack_enabled(file_name: &str, ext: &str) -> Option<bool> {
     let lower = file_name.to_ascii_lowercase();
-    if lower.ends_with(".jar.disabled") {
+    if lower.ends_with(&format!("{ext}.disabled")) {
         Some(false)
-    } else if lower.ends_with(".jar") {
+    } else if lower.ends_with(ext) {
         Some(true)
     } else {
         None
     }
 }
 
-/// 把文件名换成另一个状态的写法：`.jar` ↔ `.jar.disabled`。
+/// 把文件名换成另一个状态的写法：`x.zip` ↔ `x.zip.disabled`。
 ///
-/// 已经是目标状态或不是模组文件时返回 `None`，不用重命名。
-fn toggled_mod_name(file_name: &str, enabled: bool) -> Option<String> {
-    match (enabled, mod_enabled(file_name)?) {
+/// 已经是目标状态或后缀不匹配时返回 `None`，不用重命名。
+fn toggled_pack_name(file_name: &str, ext: &str, enabled: bool) -> Option<String> {
+    match (enabled, pack_enabled(file_name, ext)?) {
         (true, false) => {
             // `.disabled` 是纯 ASCII，按字节截断不会切在多字节字符中间。
             Some(file_name[..file_name.len() - ".disabled".len()].to_owned())
@@ -78,11 +127,11 @@ fn toggled_mod_name(file_name: &str, enabled: bool) -> Option<String> {
     }
 }
 
-/// 扫一个 mods 目录，只收 `.jar` / `.jar.disabled` 文件，按文件名排序。
-fn scan_mods(dir: &Path) -> Vec<ModEntry> {
-    let mut mods = Vec::new();
+/// 扫一个资源目录，只收 `ext` / `ext + .disabled` 文件，按文件名排序。
+fn scan_packs(dir: &Path, ext: &str) -> Vec<PackEntry> {
+    let mut packs = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return mods;
+        return packs;
     };
 
     for entry in entries.flatten() {
@@ -94,24 +143,26 @@ fn scan_mods(dir: &Path) -> Vec<ModEntry> {
         let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        let Some(enabled) = mod_enabled(&file_name) else {
+        let Some(enabled) = pack_enabled(&file_name, ext) else {
             continue;
         };
 
-        mods.push(ModEntry {
+        packs.push(PackEntry {
             path,
             file_name,
             enabled,
         });
     }
 
-    mods.sort_by_key(|entry| entry.file_name.to_ascii_lowercase());
-    mods
+    packs.sort_by_key(|entry| entry.file_name.to_ascii_lowercase());
+    packs
 }
 
-/// 模组列表：磁盘快照存在这里，点刷新或换项目时才重新扫描。
-struct ModListDelegate {
-    mods: Vec<ModEntry>,
+/// 资源文件列表：磁盘快照存在这里，点刷新、换项目或换栏目时才重新扫描。
+struct PackListDelegate {
+    /// 当前列表是哪一类资源，决定空态文案的后缀叫法。
+    kind: PackKind,
+    packs: Vec<PackEntry>,
     /// 搜索框当前的内容，过滤出要显示的行。
     query: String,
     selected_index: Option<IndexPath>,
@@ -119,11 +170,11 @@ struct ModListDelegate {
     page: WeakEntity<DevelopPage>,
 }
 
-impl ModListDelegate {
-    /// 按搜索词过滤后的模组，文件名不区分大小写做子串匹配。
-    fn visible_mods(&self) -> Vec<&ModEntry> {
+impl PackListDelegate {
+    /// 按搜索词过滤后的条目，文件名不区分大小写做子串匹配。
+    fn visible_packs(&self) -> Vec<&PackEntry> {
         let query = self.query.trim().to_ascii_lowercase();
-        self.mods
+        self.packs
             .iter()
             .filter(|entry| {
                 query.is_empty() || entry.file_name.to_ascii_lowercase().contains(&query)
@@ -132,7 +183,7 @@ impl ModListDelegate {
     }
 }
 
-impl ListDelegate for ModListDelegate {
+impl ListDelegate for PackListDelegate {
     type Item = ListItem;
 
     fn perform_search(
@@ -148,7 +199,7 @@ impl ListDelegate for ModListDelegate {
     }
 
     fn items_count(&self, _section: usize, _cx: &App) -> usize {
-        self.visible_mods().len()
+        self.visible_packs().len()
     }
 
     fn render_item(
@@ -157,7 +208,7 @@ impl ListDelegate for ModListDelegate {
         _window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) -> Option<Self::Item> {
-        let visible = self.visible_mods();
+        let visible = self.visible_packs();
         let entry = visible.get(ix.row)?;
         let file_name = entry.file_name.clone();
         let path = entry.path.clone();
@@ -179,18 +230,21 @@ impl ListDelegate for ModListDelegate {
                         .items_center()
                         .gap_2()
                         .child(
-                            Checkbox::new(SharedString::from(format!("mod-enabled-{}", ix.row)))
-                                .checked(enabled)
-                                .tooltip(if enabled {
-                                    "点击禁用"
-                                } else {
-                                    "点击启用"
-                                })
-                                .on_click(move |checked, window, cx| {
-                                    let _ = page.update(cx, |page, cx| {
-                                        page.set_mod_enabled(path.clone(), *checked, window, cx);
-                                    });
-                                }),
+                            Checkbox::new(SharedString::from(format!(
+                                "pack-enabled-{}",
+                                ix.row
+                            )))
+                            .checked(enabled)
+                            .tooltip(if enabled {
+                                "点击禁用"
+                            } else {
+                                "点击启用"
+                            })
+                            .on_click(move |checked, window, cx| {
+                                let _ = page.update(cx, |page, cx| {
+                                    page.set_pack_enabled(path.clone(), *checked, window, cx);
+                                });
+                            }),
                         )
                         .child(
                             div()
@@ -208,10 +262,10 @@ impl ListDelegate for ModListDelegate {
         _window: &mut Window,
         _cx: &mut Context<ListState<Self>>,
     ) -> impl IntoElement {
-        let text = if self.mods.is_empty() {
-            "mods 目录里没有模组"
+        let text = if self.packs.is_empty() {
+            format!("{} 目录里没有{}", self.kind.dir_name(), self.kind.noun())
         } else {
-            "没有匹配搜索的模组"
+            format!("没有匹配搜索的{}", self.kind.noun())
         };
 
         div()
@@ -240,10 +294,12 @@ pub struct DevelopPage {
     project_select: ProjectSelect,
     /// 保活项目下拉框的事件订阅。
     _select_subscription: Subscription,
-    /// 模组列表，条目是渲染期扫出来的磁盘快照。
-    mod_list: Entity<ListState<ModListDelegate>>,
-    /// 当前列表对应的 mods 目录，用来发现项目切换后需要重新扫描。
-    mods_dir: Option<PathBuf>,
+    /// 资源文件列表（模组/资源包/光影共用），条目是渲染期扫出来的磁盘快照。
+    pack_list: Entity<ListState<PackListDelegate>>,
+    /// 当前列表对应的资源类别，切换侧边栏后需要重新扫描。
+    pack_kind: Option<PackKind>,
+    /// 当前列表对应的资源目录，用来发现项目切换后需要重新扫描。
+    pack_dir: Option<PathBuf>,
     git_init_in_progress: bool,
 }
 
@@ -268,10 +324,12 @@ impl DevelopPage {
         );
 
         let page = cx.entity().downgrade();
-        let mod_list = cx.new(|cx| {
+        let pack_list = cx.new(|cx| {
             ListState::new(
-                ModListDelegate {
-                    mods: Vec::new(),
+                PackListDelegate {
+                    // 首次进入哪个栏目，sync_packs 会把 kind 拨过去。
+                    kind: PackKind::Mod,
+                    packs: Vec::new(),
                     query: String::new(),
                     selected_index: None,
                     page,
@@ -287,8 +345,9 @@ impl DevelopPage {
             section: DevelopSection::General,
             project_select,
             _select_subscription: select_subscription,
-            mod_list,
-            mods_dir: None,
+            pack_list,
+            pack_kind: None,
+            pack_dir: None,
             git_init_in_progress: false,
         }
     }
@@ -331,8 +390,8 @@ impl DevelopPage {
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let child = match self.section {
             DevelopSection::General => self.render_general(window, cx).into_any_element(),
-            DevelopSection::Mods => self.render_mod_list(window, cx).into_any_element(),
-            section => card_outline().child(section.label()).into_any_element(),
+            // 模组/资源包/光影共用同一个列表，只是目录和后缀不同。
+            _ => self.render_pack_list(window, cx).into_any_element(),
         };
         v_flex().size_full().child(child)
     }
@@ -392,57 +451,68 @@ impl DevelopPage {
             .child(git_card.child(vcs_row))
     }
 
-    /// 当前项目的 mods 目录，没选项目时为 `None`。
-    fn current_mods_dir(&self) -> Option<PathBuf> {
+    /// 当前侧边栏项对应的资源目录（如 `<project>/resourcepacks`），没选项目或「通用」页为 `None`。
+    fn current_pack_dir(&self) -> Option<PathBuf> {
+        let kind = PackKind::from_section(self.section)?;
         self.project_select
             .selected_project()
-            .map(|project| project.path.join("mods"))
+            .map(|project| project.path.join(kind.dir_name()))
     }
 
-    /// 选中项目变了就重新扫描；没变化什么都不做。
+    /// 选中项目或侧边栏变了就重新扫描；没变化什么都不做。
     ///
     /// 放在渲染期做，和 `project_select.sync` 一个思路，不用额外维护「项目变了」的通知。
-    fn sync_mods(&mut self, cx: &mut Context<Self>) {
-        let mods_dir = self.current_mods_dir();
-        if mods_dir != self.mods_dir {
-            self.reload_mods(cx);
+    fn sync_packs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let kind = PackKind::from_section(self.section);
+        let pack_dir = self.current_pack_dir();
+        if kind != self.pack_kind || pack_dir != self.pack_dir {
+            self.reload_packs(window, cx);
         }
     }
 
-    /// 重新扫描 `self.mods_dir` 并刷新列表。
-    fn reload_mods(&mut self, cx: &mut Context<Self>) {
-        self.mods_dir = self.current_mods_dir();
-        let mods = self
-            .mods_dir
+    /// 重新扫描 `self.pack_dir` 并刷新列表。
+    fn reload_packs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let kind = PackKind::from_section(self.section).unwrap_or(PackKind::Mod);
+        let kind_changed = Some(kind) != self.pack_kind;
+        self.pack_kind = Some(kind);
+        self.pack_dir = self.current_pack_dir();
+        let packs = self
+            .pack_dir
             .as_ref()
-            .map(|dir| scan_mods(dir))
+            .map(|dir| scan_packs(dir, kind.ext()))
             .unwrap_or_default();
 
-        self.mod_list.update(cx, |state, cx| {
-            state.delegate_mut().mods = mods;
+        self.pack_list.update(cx, |state, cx| {
+            state.delegate_mut().kind = kind;
+            state.delegate_mut().packs = packs;
             state.delegate_mut().selected_index = None;
+            // 换栏目时把搜索词清掉，不然新的列表会被上个栏目的词过滤掉。
+            if kind_changed {
+                state.set_query("", window, cx);
+            }
             cx.notify();
         });
     }
 
-    /// 刷新按钮：重新扫描当前项目的 mods 目录。
-    fn refresh_mods(&mut self, cx: &mut Context<Self>) {
-        self.reload_mods(cx);
+    /// 刷新按钮：重新扫描当前项目的资源目录。
+    fn refresh_packs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reload_packs(window, cx);
         cx.notify();
     }
 
-    /// 勾选框切换：把文件在 `.jar` 和 `.jar.disabled` 之间重命名。
-    fn set_mod_enabled(
+    /// 勾选框切换：把文件在正常后缀和追加 `.disabled` 之间重命名。
+    fn set_pack_enabled(
         &mut self,
         path: PathBuf,
         enabled: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let ext = self.pack_list.read(cx).delegate().kind.ext();
         let new_path = path
             .file_name()
             .and_then(|name| name.to_str())
-            .and_then(|name| toggled_mod_name(name, enabled))
+            .and_then(|name| toggled_pack_name(name, ext, enabled))
             .map(|name| path.with_file_name(name));
 
         if let Some(new_path) = new_path
@@ -451,51 +521,54 @@ impl DevelopPage {
             window.push_notification(
                 (
                     gpui_kit::component::notification::NotificationType::Error,
-                    format!("切换模组状态失败: {error}"),
+                    format!("切换{}状态失败: {error}", self.pack_list.read(cx).delegate().kind.noun()),
                 ),
                 cx,
             );
         }
 
         // 不管成败都重新扫一遍，让列表和磁盘保持一致。
-        self.reload_mods(cx);
+        self.reload_packs(window, cx);
         cx.notify();
     }
 
-    fn render_mod_list(
+    fn render_pack_list(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        // 顶部下拉框换项目后，这里负责把列表切到新项目的 mods 目录。
-        self.sync_mods(cx);
+        // 顶部下拉框换项目、侧边栏换栏目后，这里负责把列表切到对应目录。
+        self.sync_packs(window, cx);
 
-        let Some(mods_dir) = self.mods_dir.clone() else {
+        let Some(pack_dir) = self.pack_dir.clone() else {
             return v_flex().size_full().child(
                 card_outline()
-                    .child(Label::new("模组管理"))
+                    .child(Label::new(self.section.label()))
                     .child(Label::new("当前没有选中的整合包").text_color(rgb(0x9ca3af))),
             );
         };
+        let noun = PackKind::from_section(self.section)
+            .unwrap_or(PackKind::Mod)
+            .noun();
 
         let toolbar = h_flex()
             .w_full()
             .items_center()
             .gap_2()
             .child(
-                Button::new("refresh-mods")
+                Button::new("refresh-packs")
                     .icon(IconName::RotateCw)
                     .label("刷新")
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh_mods(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.refresh_packs(window, cx))),
             )
             .child(
-                Button::new("open-mods-folder")
+                Button::new("open-pack-folder")
                     .icon(IconName::FolderOpen)
                     .label("打开文件夹")
                     .on_click(move |_, _, cx| {
                         // 目录还不存在时先建出来，免得系统资源管理器报错。
-                        let _ = std::fs::create_dir_all(&mods_dir);
-                        cx.reveal_path(&mods_dir);
+                        let _ = std::fs::create_dir_all(&pack_dir);
+                        cx.reveal_path(&pack_dir);
                     }),
             );
 
@@ -504,9 +577,9 @@ impl DevelopPage {
             .gap_2()
             .child(toolbar)
             .child(
-                List::new(&self.mod_list)
+                List::new(&self.pack_list)
                     .flex_1()
-                    .search_placeholder("搜索模组")
+                    .search_placeholder(format!("搜索{noun}"))
                     // 给列表加个边框，行内容稍微内缩一点，不贴着边框。
                     .p_1()
                     .border_1()
