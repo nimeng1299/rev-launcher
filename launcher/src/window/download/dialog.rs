@@ -25,13 +25,27 @@ use gpui_kit::{
 };
 use rfd::AsyncFileDialog;
 
+use mclib::java::java_version::JavaVersion;
+use mclib::project::install::{install_forge, install_minecraft};
 use mclib::project::install::progress::{InstallProgress, InstallState};
+use mclib::project::versions::forge;
 use mclib::project::versions::minecreft::Version;
 
 use crate::data::app_data::ProjectsRevision;
 use crate::data::settings::AppSettings;
 
 const INSTALL_STEPS: [&str; 3] = ["下载版本清单", "下载运行文件", "写入项目文件"];
+
+/// Forge 安装的步骤列表，比原版多安装器、支持库和处理器三个阶段。
+const FORGE_STEPS: [&str; 7] = [
+    "下载安装器",
+    "下载版本清单",
+    "下载运行文件",
+    "下载支持库",
+    "运行安装处理器",
+    "写入版本 JSON",
+    "写入项目文件",
+];
 
 /// 安装目录下拉框里的一项：设置里的版本目录、用户另选的目录，或者末尾的「浏览…」。
 ///
@@ -88,6 +102,59 @@ fn dir_option_items(paths: &[PathBuf], custom: Option<&PathBuf>) -> Vec<DirOptio
     items
 }
 
+/// 附加加载器选项：原版不装加载器，Forge 需要再选一个 Forge 版本。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoaderKind {
+    Vanilla,
+    Forge,
+}
+
+/// 加载器下拉框里的一项。
+#[derive(Debug, Clone)]
+struct LoaderItem {
+    kind: LoaderKind,
+    label: SharedString,
+}
+
+impl SearchableListItem for LoaderItem {
+    type Value = LoaderKind;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.kind
+    }
+}
+
+/// Forge 版本下拉框里的一项，value 是 Forge 版本号字符串。
+#[derive(Debug, Clone)]
+struct ForgeVersionItem {
+    version: String,
+}
+
+impl SearchableListItem for ForgeVersionItem {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        SharedString::from(self.version.clone())
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.version
+    }
+}
+
+/// Forge 版本列表的加载状态；选中 Forge 后由后台请求填充。
+enum ForgeList {
+    /// 还没请求过。
+    Idle,
+    Loading,
+    Loaded(Vec<forge::Version>),
+    Failed(String),
+}
+
 /// 下载状态：`None` 还在表单阶段，`Running` 携带当前步骤下标。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InstallStatus {
@@ -129,7 +196,32 @@ fn step_status(index: usize, status: InstallStatus) -> StepStatus {
     }
 }
 
-fn step_marker(index: usize, status: StepStatus, cx: &App) -> Marker {
+/// 把安装状态映射到步骤下标；Forge 和原版的步骤含义不同。
+fn step_index(state: InstallState, forge: bool) -> usize {
+    match state {
+        InstallState::Ready | InstallState::DownloadInstaller => 0,
+        InstallState::DownloadVersionJson => {
+            if forge {
+                1
+            } else {
+                0
+            }
+        }
+        InstallState::InstallJar => {
+            if forge {
+                2
+            } else {
+                1
+            }
+        }
+        InstallState::DownloadLibraries => 3,
+        InstallState::RunProcessors => 4,
+        InstallState::WriteVersionJson => 5,
+        InstallState::Success | InstallState::Failed => 0,
+    }
+}
+
+fn step_marker(index: usize, label: &str, status: StepStatus, cx: &App) -> Marker {
     let (text, color) = match status {
         StepStatus::Pending => ("等待中", cx.theme().muted_foreground),
         StepStatus::Active => ("进行中", cx.theme().primary),
@@ -154,7 +246,7 @@ fn step_marker(index: usize, status: StepStatus, cx: &App) -> Marker {
                 ),
             )
         })
-        .content(MarkerContent::new().text_color(color).text(INSTALL_STEPS[index]))
+        .content(MarkerContent::new().text_color(color).text(label.to_owned()))
         .child(div().flex_1())
         .child(Label::new(text).text_sm())
 }
@@ -169,6 +261,18 @@ pub(super) struct DownloadDialog {
     custom_dir: Option<PathBuf>,
     /// 项目名称输入框，留空时默认用版本号。
     name_input: Entity<InputState>,
+    /// 加载器下拉框。
+    loader_select: Entity<SelectState<Vec<LoaderItem>>>,
+    /// 当前选中的加载器。
+    loader: LoaderKind,
+    /// Forge 版本下拉框，选中 Forge 后才展示。
+    forge_select: Entity<SelectState<Vec<ForgeVersionItem>>>,
+    /// 下拉框当前确认的 Forge 版本号。
+    selected_forge: Option<String>,
+    /// Forge 版本列表的加载状态。
+    forge_list: ForgeList,
+    /// 当前展示的安装步骤；选了 Forge 后换成 `FORGE_STEPS`。
+    steps: &'static [&'static str],
     /// 表单校验错误，直接画在对话框里（通知会盖住对话框）。
     form_error: Option<String>,
     /// 下载状态，由轮询 `progress` 的任务写入，渲染时读取。
@@ -181,6 +285,8 @@ pub(super) struct DownloadDialog {
     installed_name: Option<String>,
     focus_handle: FocusHandle,
     _dir_subscription: Subscription,
+    _loader_subscription: Subscription,
+    _forge_subscription: Subscription,
 }
 
 impl DownloadDialog {
@@ -275,12 +381,70 @@ impl DownloadDialog {
                 .placeholder("项目名称")
         });
 
+        // 加载器下拉框：默认原版，选 Forge 后后台拉取该 MC 版本的 Forge 列表。
+        let loader_select = cx.new(|cx| {
+            SelectState::new(
+                vec![
+                    LoaderItem {
+                        kind: LoaderKind::Vanilla,
+                        label: SharedString::from("原版"),
+                    },
+                    LoaderItem {
+                        kind: LoaderKind::Forge,
+                        label: SharedString::from("Forge"),
+                    },
+                ],
+                Some(IndexPath::new(0)),
+                window,
+                cx,
+            )
+        });
+        let loader_subscription = cx.subscribe_in(
+            &loader_select,
+            window,
+            |this: &mut Self, _state, event: &SelectEvent<Vec<LoaderItem>>, window, cx| {
+                let SelectEvent::Confirm(kind) = event;
+                match kind {
+                    Some(LoaderKind::Forge) => {
+                        if this.loader != LoaderKind::Forge {
+                            this.loader = LoaderKind::Forge;
+                            this.load_forge_versions(window, cx);
+                        }
+                    }
+                    Some(LoaderKind::Vanilla) | None => {
+                        this.loader = LoaderKind::Vanilla;
+                    }
+                }
+                cx.notify();
+            },
+        );
+
+        // Forge 版本下拉框：选中 Forge 后开始后台请求，这里先放空列表。
+        let forge_select = cx.new(|cx| {
+            SelectState::new(Vec::new(), None, window, cx).searchable(true)
+        });
+        let forge_subscription = cx.subscribe_in(
+            &forge_select,
+            window,
+            |this: &mut Self, _state, event: &SelectEvent<Vec<ForgeVersionItem>>, _window, cx| {
+                let SelectEvent::Confirm(value) = event;
+                this.selected_forge = value.clone();
+                cx.notify();
+            },
+        );
+
         Self {
             version,
             dir_select,
             selected_dir,
             custom_dir: None,
             name_input,
+            loader_select,
+            loader: LoaderKind::Vanilla,
+            forge_select,
+            selected_forge: None,
+            forge_list: ForgeList::Idle,
+            steps: &INSTALL_STEPS,
             form_error: None,
             status: Arc::new(Mutex::new(None)),
             progress: None,
@@ -288,7 +452,65 @@ impl DownloadDialog {
             installed_name: None,
             focus_handle: cx.focus_handle(),
             _dir_subscription: dir_subscription,
+            _loader_subscription: loader_subscription,
+            _forge_subscription: forge_subscription,
         }
+    }
+
+    /// 后台请求该 MC 版本的 Forge 列表，成功后填充版本下拉框并默认选中第一项。
+    fn load_forge_versions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.forge_list = ForgeList::Loading;
+        let mc_version = self.version.id.clone();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { forge::ForgeVersions::get_versions(mc_version) })
+                .await;
+            let _ = view.update_in(cx, |this, window, cx| match result {
+                Ok(list) => {
+                    // 默认选中列表第一项（通常是最新的 Forge 版本）。
+                    this.selected_forge = list
+                        .versions
+                        .first()
+                        .map(|version| version.version.clone());
+                    let items: Vec<_> = list
+                        .versions
+                        .iter()
+                        .map(|version| ForgeVersionItem {
+                            version: version.version.clone(),
+                        })
+                        .collect();
+                    let index = (!items.is_empty()).then(|| IndexPath::new(0));
+                    this.forge_list = ForgeList::Loaded(list.versions);
+                    this.forge_select.update(cx, |state, cx| {
+                        state.set_items(items, window, cx);
+                        state.set_selected_index(index, window, cx);
+                    });
+                    cx.notify();
+                }
+                Err(error) => {
+                    this.forge_list = ForgeList::Failed(error.to_string());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 给安装处理器挑一个 Java：优先全局设置里指定的，其次是默认项，最后取扫描到的第一个。
+    fn resolve_java(&self, cx: &App) -> Result<JavaVersion, String> {
+        let settings = cx.global::<AppSettings>();
+        settings
+            .global_settings
+            .java
+            .clone()
+            .or_else(|| {
+                settings
+                    .default_java_version
+                    .and_then(|ix| settings.java_versions.get(ix).cloned())
+            })
+            .or_else(|| settings.java_versions.first().cloned())
+            .ok_or_else(|| "未找到可用的 Java，请先在设置中添加 Java".to_owned())
     }
 
     /// 下拉框里有多少项。
@@ -339,7 +561,7 @@ impl DownloadDialog {
     }
 
     /// 点「下载」：校验表单，然后交给 `InstallProgress::install_minecraft`
-    /// 在新线程中执行；这里只起一个轮询任务同步界面状态。
+    /// 或 `install_forge` 在新线程中执行；这里只起一个轮询任务同步界面状态。
     fn start_install(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.progress.is_some() {
             return;
@@ -360,10 +582,66 @@ impl DownloadDialog {
             return;
         }
 
+        // 选了 Forge 才需要版本号和 Java；校验失败就直接展示在表单上。
+        let forge_version = if self.loader == LoaderKind::Forge {
+            let selected = match &self.selected_forge {
+                Some(version) => version.clone(),
+                None => {
+                    self.form_error = Some(match &self.forge_list {
+                        ForgeList::Loading => "Forge 版本列表加载中，请稍候".to_owned(),
+                        ForgeList::Failed(error) => format!("获取 Forge 版本失败：{error}"),
+                        _ => "请选择 Forge 版本".to_owned(),
+                    });
+                    cx.notify();
+                    return;
+                }
+            };
+            let ForgeList::Loaded(versions) = &self.forge_list else {
+                self.form_error = Some("请选择 Forge 版本".to_owned());
+                cx.notify();
+                return;
+            };
+            match versions.iter().find(|version| version.version == selected) {
+                Some(version) => Some(version.clone()),
+                None => {
+                    self.form_error = Some("选择的 Forge 版本已失效，请重新选择".to_owned());
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let java = if forge_version.is_some() {
+            match self.resolve_java(cx) {
+                Ok(java) => Some(java),
+                Err(error) => {
+                    self.form_error = Some(error);
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
         self.form_error = None;
+        let is_forge = forge_version.is_some();
+        self.steps = if is_forge {
+            &FORGE_STEPS
+        } else {
+            &INSTALL_STEPS
+        };
         *self.status.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(InstallStatus::Running(0));
-        let progress = InstallProgress::install_minecraft(&name, &root, &self.version);
+        let progress = match (forge_version, java) {
+            (Some(version), Some(java)) => {
+                // 支持库放进全局支持库目录，和启动阶段读取的位置一致。
+                let libraries = cx.global::<AppSettings>().global_settings.libraries_path.clone();
+                install_forge(&name, &root, &libraries, java, &version)
+            }
+            _ => install_minecraft(&name, &root, &self.version),
+        };
         self.progress = Some(progress.clone());
 
         // 轮询安装状态：映射到步骤下标并刷新界面，结束后写入结果。
@@ -374,15 +652,8 @@ impl DownloadDialog {
                     .await;
                 let keep_polling = view
                     .update_in(cx, |dialog, _window, cx| {
-                        match progress.state() {
-                            InstallState::Ready | InstallState::DownloadVersionJson => {
-                                *dialog.status.lock().unwrap_or_else(|e| e.into_inner()) =
-                                    Some(InstallStatus::Running(0));
-                            }
-                            InstallState::InstallJar => {
-                                *dialog.status.lock().unwrap_or_else(|e| e.into_inner()) =
-                                    Some(InstallStatus::Running(1));
-                            }
+                        let state = progress.state();
+                        match state {
                             InstallState::Success => {
                                 *dialog.status.lock().unwrap_or_else(|e| e.into_inner()) =
                                     Some(InstallStatus::Done);
@@ -402,7 +673,7 @@ impl DownloadDialog {
                                     .unwrap_or_else(|e| e.into_inner())
                                 {
                                     Some(InstallStatus::Running(step)) => step,
-                                    _ => INSTALL_STEPS.len() - 1,
+                                    _ => dialog.steps.len() - 1,
                                 };
                                 if let Some(error) = progress.error() {
                                     *dialog.error.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -412,6 +683,12 @@ impl DownloadDialog {
                                     Some(InstallStatus::Failed(step));
                                 cx.notify();
                                 return false;
+                            }
+                            state => {
+                                *dialog.status.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    Some(InstallStatus::Running(step_index(
+                                        state, is_forge,
+                                    )));
                             }
                         }
                         cx.notify();
@@ -435,6 +712,7 @@ impl DownloadDialog {
         window.open_dialog(cx, move |builder, window, cx| {
             let view = dialog.read(cx);
             let running = view.is_running();
+            let is_forge = view.loader == LoaderKind::Forge;
             let finished = view
                 .status
                 .lock()
@@ -458,6 +736,8 @@ impl DownloadDialog {
                                 "关闭弹窗后下载会继续进行"
                             } else if finished {
                                 "下载流程已结束"
+                            } else if is_forge {
+                                "安装器会自动下载 Forge 支持库"
                             } else {
                                 "游戏文件将在首次启动时下载"
                             })
@@ -511,7 +791,7 @@ impl Render for DownloadDialog {
             .pb_2();
 
         match status {
-            // 表单阶段：安装目录 + 项目名称。
+            // 表单阶段：安装目录 + 加载器 + 项目名称。
             None => {
                 content = content
                     .child(
@@ -524,6 +804,70 @@ impl Render for DownloadDialog {
                                     .w_full()
                                     .placeholder("选择安装目录"),
                             ),
+                    )
+                    .child(
+                        div()
+                            .v_flex()
+                            .gap_1()
+                            .child(Label::new("加载器").text_sm())
+                            .child(
+                                div()
+                                    .h_flex()
+                                    .w_full()
+                                    .gap_2()
+                                    .child(
+                                        Select::new(&self.loader_select)
+                                            .w(px(120.))
+                                            .placeholder("原版"),
+                                    )
+                                    .when(self.loader == LoaderKind::Forge, |row| {
+                                        let placeholder = match &self.forge_list {
+                                            ForgeList::Loading => "正在获取 Forge 版本…",
+                                            ForgeList::Failed(_) => "获取失败",
+                                            _ => "选择 Forge 版本",
+                                        };
+                                        row.child(
+                                            Select::new(&self.forge_select)
+                                                .flex_1()
+                                                .w_full()
+                                                .placeholder(placeholder)
+                                                .disabled(matches!(
+                                                    self.forge_list,
+                                                    ForgeList::Loading
+                                                        | ForgeList::Failed(_)
+                                                )),
+                                        )
+                                        .when(
+                                            matches!(self.forge_list, ForgeList::Failed(_)),
+                                            |row| {
+                                                row.child(
+                                                    Button::new("retry-forge-versions")
+                                                        .label("重试")
+                                                        .on_click(cx.listener(
+                                                            |this, _, window, cx| {
+                                                                this.load_forge_versions(
+                                                                    window, cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                )
+                                            },
+                                        )
+                                    }),
+                            ),
+                    )
+                    .when_some(
+                        match &self.forge_list {
+                            ForgeList::Failed(error) => Some(error.clone()),
+                            _ => None,
+                        },
+                        |content, error| {
+                            content.child(
+                                Label::new(format!("获取 Forge 版本失败：{error}"))
+                                    .text_sm()
+                                    .text_color(cx.theme().danger),
+                            )
+                        },
                     )
                     .child(
                         div()
@@ -542,9 +886,9 @@ impl Render for DownloadDialog {
             }
             // 进度阶段：和启动弹窗一样的步骤列表。
             Some(status) => {
-                for index in 0..INSTALL_STEPS.len() {
+                for index in 0..self.steps.len() {
                     let step = step_status(index, status);
-                    content = content.child(step_marker(index, step, cx));
+                    content = content.child(step_marker(index, self.steps[index], step, cx));
                     if step == StepStatus::Failed
                         && let Some(error) = &error
                     {

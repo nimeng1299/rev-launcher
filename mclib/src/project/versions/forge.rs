@@ -11,6 +11,8 @@ pub struct ForgeVersions {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Version {
+    /// Minecraft版本
+    pub id: String,
     pub version: String,
     pub time: String,
     pub download_url: String,
@@ -89,6 +91,7 @@ impl ForgeVersions {
                 .unwrap_or_else(|| forge_maven_url(&id, &version));
 
             versions.push(Version {
+                id: id.clone(),
                 version,
                 time,
                 download_url,

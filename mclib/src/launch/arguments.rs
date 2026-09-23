@@ -25,7 +25,7 @@ pub(super) fn invalid(message: impl Into<String>) -> crate::error::Error {
     crate::error::Error::LaunchFailed(message.into())
 }
 
-pub(super) fn relative_path(value: &str) -> Result<PathBuf, crate::error::Error> {
+pub(crate) fn relative_path(value: &str) -> Result<PathBuf, crate::error::Error> {
     // 同时检查两种路径分隔符，避免在不同平台上解释出不同的目标路径。
     let path = PathBuf::from(value.replace('\\', "/"));
     if value.is_empty()
@@ -39,7 +39,7 @@ pub(super) fn relative_path(value: &str) -> Result<PathBuf, crate::error::Error>
     Ok(path)
 }
 
-pub(super) fn library_path(library: &Value) -> Result<Option<PathBuf>, crate::error::Error> {
+pub(crate) fn library_path(library: &Value) -> Result<Option<PathBuf>, crate::error::Error> {
     if let Some(path) = library
         .pointer("/downloads/artifact/path")
         .and_then(Value::as_str)
@@ -56,7 +56,7 @@ pub(super) fn library_path(library: &Value) -> Result<Option<PathBuf>, crate::er
     maven_path(name).map(Some)
 }
 
-pub(super) fn maven_path(name: &str) -> Result<PathBuf, crate::error::Error> {
+pub(crate) fn maven_path(name: &str) -> Result<PathBuf, crate::error::Error> {
     let (coordinate, extension) = name.split_once('@').unwrap_or((name, "jar"));
     let parts: Vec<_> = coordinate.split(':').collect();
     if !(3..=4).contains(&parts.len())
@@ -111,7 +111,7 @@ pub(super) fn native_artifact(library: &Value) -> Result<Option<Value>, crate::e
         .ok_or_else(|| invalid(format!("缺少 native 下载信息：{classifier}")))
 }
 
-pub(super) struct RuleContext {
+pub(crate) struct RuleContext {
     pub os: String,
     pub arch: String,
     pub version: String,
@@ -138,7 +138,7 @@ impl RuleContext {
     }
 }
 
-pub(super) fn rules_allow(value: &Value, context: &RuleContext) -> Result<bool, crate::error::Error> {
+pub(crate) fn rules_allow(value: &Value, context: &RuleContext) -> Result<bool, crate::error::Error> {
     let Some(rules) = value.get("rules") else {
         return Ok(true);
     };

@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-mod arguments;
+pub(crate) mod arguments;
 mod libraries;
 mod loaders;
 mod logging;
