@@ -22,7 +22,40 @@ fn detective_path(project: &GameProject) -> PathBuf {
     project.path.join(".rev_launcher")
 }
 
-/// [`serialize_mods`] 在工作线程中发出的进度事件。
+/// 可以被序列化/反序列化的资源类别，和项目下的资源目录一一对应。
+///
+/// 元数据（描述每个文件的 TOML）写在
+/// `<项目>/.rev_launcher/<dir_name>/` 下，资源本身在 `<项目>/<dir_name>/` 下。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    /// `mods` 目录，`.jar` 文件。
+    Mod,
+    /// `resourcepacks` 目录，`.zip` 文件。
+    ResourcePack,
+    /// `shaderpacks` 目录，`.zip` 文件。
+    Shader,
+}
+
+impl ResourceKind {
+    /// 项目目录下的资源文件夹名，同时是 `.rev_launcher` 下的元数据目录名。
+    pub fn dir_name(self) -> &'static str {
+        match self {
+            Self::Mod => "mods",
+            Self::ResourcePack => "resourcepacks",
+            Self::Shader => "shaderpacks",
+        }
+    }
+
+    /// 参与序列化的文件后缀（不带点，比较时忽略大小写）。
+    pub fn ext(self) -> &'static str {
+        match self {
+            Self::Mod => "jar",
+            Self::ResourcePack | Self::Shader => "zip",
+        }
+    }
+}
+
+/// [`serialize_mods`] / [`serialize_resources`] 在工作线程中发出的进度事件。
 ///
 /// 通过返回的 channel 接收；channel 关闭（for 循环结束 / `recv` 返回 `Err`）
 /// 表示整个序列化流程结束。
@@ -40,28 +73,29 @@ pub enum SerializeModsProgress {
     Done { total: usize },
 }
 
-/// 在独立线程中扫描游戏 mods 目录下的所有 jar，通过 CurseForge 指纹和
-/// Modrinth sha1 批量查询 mod 信息，并把每个 jar 的 [`ModInfo`] 用 toml_edit
-/// 序列化到 `<项目>/.rev_launcher/mods/<文件名>.toml`（文件名在原名后追加
+/// 在独立线程中扫描项目资源目录下的所有文件，通过 CurseForge 指纹和
+/// Modrinth sha1 批量查询资源信息，并把每个文件的 [`ModInfo`] 用 toml_edit
+/// 序列化到 `<项目>/.rev_launcher/<资源目录>/<文件名>.toml`（文件名在原名后追加
 /// `.toml`）。
 ///
-/// 两个平台都没有匹配到的 mod 也会写入只含 filename 的 TOML 文件。
+/// 两个平台都没有匹配到的资源也会写入只含 filename 的 TOML 文件。
 ///
 /// 返回接收进度的 channel，事件见 [`SerializeModsProgress`]；
 /// 线程执行中出错时 channel 会先发出 `Err` 再关闭。
-pub fn serialize_mods(
+pub fn serialize_resources(
     project: &GameProject,
+    kind: ResourceKind,
 ) -> Result<mpsc::Receiver<Result<SerializeModsProgress, Error>>, Error> {
-    let out_dir = detective_path(project).join("mods");
+    let out_dir = detective_path(project).join(kind.dir_name());
     std::fs::create_dir_all(&out_dir)?;
 
-    let mod_path = project.path.join("mods");
-    let jars = list_jars(&mod_path)?;
+    let resource_dir = project.path.join(kind.dir_name());
+    let files = list_files(&resource_dir, kind.ext())?;
 
     let (tx, rx) = mpsc::channel();
 
     std::thread::spawn(move || {
-        let result = serialize_mods_in_thread(jars, out_dir, &tx);
+        let result = serialize_resources_in_thread(files, out_dir, &tx);
         if let Err(e) = result {
             let _ = tx.send(Err(e));
         }
@@ -71,10 +105,17 @@ pub fn serialize_mods(
     Ok(rx)
 }
 
+/// 序列化 mods 目录；等价于 `serialize_resources(project, ResourceKind::Mod)`。
+pub fn serialize_mods(
+    project: &GameProject,
+) -> Result<mpsc::Receiver<Result<SerializeModsProgress, Error>>, Error> {
+    serialize_resources(project, ResourceKind::Mod)
+}
+
 /// 线程内的实际序列化流程，成功时返回处理（写入或跳过）的文件数量。
-/// 对应 toml 已存在且记录的 sha1 与当前 jar 一致时跳过该 jar，不重新查询和写入。
-fn serialize_mods_in_thread(
-    jars: Vec<PathBuf>,
+/// 对应 toml 已存在且记录的 sha1 与当前文件一致时跳过该文件，不重新查询和写入。
+fn serialize_resources_in_thread(
+    files: Vec<PathBuf>,
     out_dir: PathBuf,
     tx: &Sender<Result<SerializeModsProgress, Error>>,
 ) -> Result<usize, Error> {
@@ -83,23 +124,23 @@ fn serialize_mods_in_thread(
         let _ = tx.send(Ok(event));
     };
 
-    if jars.is_empty() {
+    if files.is_empty() {
         send(SerializeModsProgress::WriteStart { total: 0 });
         send(SerializeModsProgress::Done { total: 0 });
         return Ok(0);
     }
 
-    let total = jars.len();
+    let total = files.len();
     send(SerializeModsProgress::WriteStart { total });
 
-    // 预计算每个 jar 的 sha1；已序列化过且哈希一致的视为有效，跳过后续查询
-    let mut sha1_by_jar: HashMap<&PathBuf, String> = HashMap::new();
+    // 预计算每个文件的 sha1；已序列化过且哈希一致的视为有效，跳过后续查询
+    let mut sha1_by_file: HashMap<&PathBuf, String> = HashMap::new();
     let mut fresh: HashSet<&PathBuf> = HashSet::new();
-    for (index, jar) in jars.iter().enumerate() {
-        let Some(filename) = jar.file_name().and_then(|name| name.to_str()) else {
+    for (index, file) in files.iter().enumerate() {
+        let Some(filename) = file.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        let Ok(sha1) = modrinth_sha1(jar) else {
+        let Ok(sha1) = modrinth_sha1(file) else {
             continue;
         };
         let toml_path = out_dir.join(format!("{}.toml", filename));
@@ -107,17 +148,17 @@ fn serialize_mods_in_thread(
             && let Ok(info) = toml_edit::de::from_str::<ModInfo>(&content)
             && info.sha1 == sha1
         {
-            fresh.insert(jar);
+            fresh.insert(file);
             send(SerializeModsProgress::WriteDone {
                 index,
                 filename: filename.to_string(),
             });
             continue;
         }
-        sha1_by_jar.insert(jar, sha1);
+        sha1_by_file.insert(file, sha1);
     }
 
-    let to_query: Vec<&PathBuf> = jars.iter().filter(|jar| !fresh.contains(jar)).collect();
+    let to_query: Vec<&PathBuf> = files.iter().filter(|file| !fresh.contains(file)).collect();
     if !to_query.is_empty() {
         send(SerializeModsProgress::QueryCurseforge);
         let curse_matches = find_curse_info_with_rev_ua(to_query.clone())?;
@@ -135,21 +176,21 @@ fn serialize_mods_in_thread(
         send(SerializeModsProgress::QueryModrinth);
         let modrinth_versions = find_modrinth_info_with_rev_ua(to_query)?;
 
-        for (index, jar) in jars.iter().enumerate() {
-            if fresh.contains(jar) {
+        for (index, file) in files.iter().enumerate() {
+            if fresh.contains(file) {
                 continue;
             }
-            let Some(filename) = jar.file_name().and_then(|name| name.to_str()) else {
+            let Some(filename) = file.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
 
-            let curseforge = fingerprint(jar)
+            let curseforge = fingerprint(file)
                 .ok()
                 .map(|fp| fp as i64)
                 .and_then(|fp| curse_by_fingerprint.get(&fp).cloned());
 
-            let modrinth = sha1_by_jar
-                .get(jar)
+            let modrinth = sha1_by_file
+                .get(file)
                 .and_then(|sha1| modrinth_versions.get(sha1))
                 .map(|version| ModrinthInfo {
                     id: version.id.clone(),
@@ -157,7 +198,7 @@ fn serialize_mods_in_thread(
 
             let info = ModInfo {
                 filename: filename.to_string(),
-                sha1: sha1_by_jar.get(jar).cloned().unwrap_or_default(),
+                sha1: sha1_by_file.get(file).cloned().unwrap_or_default(),
                 curseforge,
                 modrinth,
             };
@@ -177,24 +218,28 @@ fn serialize_mods_in_thread(
 }
 
 // ---------------------------------------------------------------------------
-// 反序列化：读取 toml 信息并下载 mod
+// 反序列化：读取 toml 信息并下载资源文件
 // ---------------------------------------------------------------------------
 
-/// 读取 `<项目>/.rev_launcher/mods/*.toml` 并提交 mod 下载任务，立即返回下载器。
+/// 读取 `<项目>/.rev_launcher/<资源目录>/*.toml` 并提交下载任务，立即返回下载器。
 ///
-/// 文件读取和创建 mods 目录失败会直接返回 `Err`；平台查询、下载和校验错误记录在
+/// 文件读取和创建资源目录失败会直接返回 `Err`；平台查询、下载和校验错误记录在
 /// 各任务的 `failed_reason()` 中。查询与下载共用 `threads` 个 Worker（至少一个）。
 /// 优先使用 Modrinth，失败时尝试 CurseForge；下载失败后换渠道重试一次。
 /// 本地文件 SHA-1 一致时跳过，任务成功且 `task.options().skip_download` 为 `true`。
 /// 调用方通过 `tasks()`、`is_finished()` 和 `is_all_success()` 查询进度与结果。
 /// 需要保留返回的下载器直到任务结束；丢弃下载器会取消任务。
-pub fn deserialize_mods(project: &GameProject, threads: usize) -> Result<Downloader, Error> {
-    let mods = read_mod_infos(&detective_path(project).join("mods"))?;
-    let mods_dir = project.path.join("mods");
-    std::fs::create_dir_all(&mods_dir)?;
+pub fn deserialize_resources(
+    project: &GameProject,
+    kind: ResourceKind,
+    threads: usize,
+) -> Result<Downloader, Error> {
+    let infos = read_mod_infos(&detective_path(project).join(kind.dir_name()))?;
+    let resource_dir = project.path.join(kind.dir_name());
+    std::fs::create_dir_all(&resource_dir)?;
     let mut downloader = DownloadBuilder::new().thread_num(threads.max(1)).build();
-    for info in mods {
-        let path = mods_dir.clone();
+    for info in infos {
+        let path = resource_dir.clone();
         downloader.download(move |builder| {
             builder
                 .path(path)
@@ -216,6 +261,11 @@ pub fn deserialize_mods(project: &GameProject, threads: usize) -> Result<Downloa
         });
     }
     Ok(downloader)
+}
+
+/// 反序列化 mods 目录；等价于 `deserialize_resources(project, ResourceKind::Mod, threads)`。
+pub fn deserialize_mods(project: &GameProject, threads: usize) -> Result<Downloader, Error> {
+    deserialize_resources(project, ResourceKind::Mod, threads)
 }
 
 /// 从目录读取所有 toml 文件并反序列化为 [`ModInfo`]，按 filename 排序。
@@ -349,38 +399,40 @@ fn prepare_mod_download(
     options
 }
 
-/// 列出目录下所有 jar 文件（扩展名不区分大小写），按路径排序。
-/// 目录不存在视为没有 jar。
-fn list_jars(dir: &Path) -> Result<Vec<PathBuf>, Error> {
+/// 列出目录下所有 `ext` 后缀的文件（扩展名不区分大小写），按路径排序。
+/// 目录不存在视为没有文件。
+fn list_files(dir: &Path, ext: &str) -> Result<Vec<PathBuf>, Error> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
         Err(e) => return Err(e.into()),
     };
 
-    let mut jars: Vec<PathBuf> = entries
+    let mut files: Vec<PathBuf> = entries
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| {
             path.is_file()
                 && path
                     .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jar"))
+                    .is_some_and(|file_ext| file_ext.eq_ignore_ascii_case(ext))
         })
         .collect();
-    jars.sort();
-    Ok(jars)
+    files.sort();
+    Ok(files)
 }
 
 #[cfg(test)]
 mod tests {
     use super::SerializeModsProgress;
     use super::deserialize_mods;
-    use super::list_jars;
+    use super::deserialize_resources;
+    use super::list_files;
     use super::read_mod_infos;
     use super::serialize_mods;
-    use super::serialize_mods_in_thread;
-    use super::{DownloadChannel, ResolvedDownload, prepare_mod_download, resolve_download_info};
+    use super::serialize_resources;
+    use super::serialize_resources_in_thread;
+    use super::{DownloadChannel, ResourceKind, ResolvedDownload, prepare_mod_download, resolve_download_info};
     use crate::detective::mod_info::{CurseforgeInfo, ModInfo, ModrinthInfo};
     use crate::project::game_project::{GameProject, ModLoader};
     use sharingan::status::DownloadFailure;
@@ -531,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn list_jars_test() {
+    fn list_files_test() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.jar"), b"jar").unwrap();
         std::fs::write(dir.path().join("b.JAR"), b"jar").unwrap();
@@ -539,19 +591,27 @@ mod tests {
         std::fs::write(dir.path().join("jar.txt"), b"text").unwrap();
         std::fs::create_dir(dir.path().join("d.jar")).unwrap();
 
-        let jars = list_jars(dir.path()).unwrap();
+        let jars = list_files(dir.path(), "jar").unwrap();
         let names: Vec<String> = jars
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert_eq!(names, vec!["a.jar", "b.JAR"]);
+
+        // 按后缀过滤：zip 目录只收 zip
+        let zips: Vec<String> = list_files(dir.path(), "zip")
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(zips, vec!["c.zip"]);
     }
 
     #[test]
     fn list_jars_missing_dir_test() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("not_exist");
-        assert!(list_jars(&missing).unwrap().is_empty());
+        assert!(list_files(&missing, "jar").unwrap().is_empty());
     }
 
     #[test]
@@ -586,7 +646,7 @@ mod tests {
         assert_eq!(toml.trim(), "filename = \"unknown.jar\"");
     }
 
-    /// 没有 jar 时线程只发 WriteStart{0} 和 Done{0}，不触发网络请求
+    /// 资源目录为空时线程只发 WriteStart{0} 和 Done{0}，不触发网络请求
     #[test]
     fn serialize_mods_progress_empty_test() {
         let dir = tempfile::tempdir().unwrap();
@@ -619,7 +679,7 @@ mod tests {
         assert_eq!(events.len(), 2);
     }
 
-    /// toml 已存在且记录的 sha1 与当前 jar 一致时直接跳过：
+    /// toml 已存在且记录的 sha1 与当前文件一致时直接跳过：
     /// 不发起平台查询，也不重写 toml。
     #[test]
     fn serialize_mods_in_thread_skips_fresh_toml_test() {
@@ -641,7 +701,7 @@ mod tests {
         std::fs::write(&toml_path, &original).unwrap();
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let handled = serialize_mods_in_thread(vec![jar_path], out_dir, &tx).unwrap();
+        let handled = serialize_resources_in_thread(vec![jar_path], out_dir, &tx).unwrap();
         drop(tx);
         let events: Vec<_> = rx.into_iter().collect();
 
@@ -708,5 +768,81 @@ mod tests {
         assert!(downloader.tasks().is_empty());
         assert!(downloader.is_finished());
         assert!(downloader.is_all_success());
+    }
+
+    /// 反序列化其它资源类别：toml 读自 `.rev_launcher/resourcepacks`，
+    /// 下载目标目录是项目的 `resourcepacks`。
+    #[test]
+    fn deserialize_resources_uses_kind_dirs_test() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = test_project(directory.path());
+        let metadata = directory.path().join(".rev_launcher/resourcepacks");
+        std::fs::create_dir_all(&metadata).unwrap();
+        let info = ModInfo {
+            filename: "pack.zip".into(),
+            sha1: String::new(),
+            curseforge: None,
+            modrinth: None,
+        };
+        std::fs::write(
+            metadata.join("pack.zip.toml"),
+            toml_edit::ser::to_string_pretty(&info).unwrap(),
+        )
+        .unwrap();
+
+        let downloader =
+            deserialize_resources(&project, ResourceKind::ResourcePack, 2).unwrap();
+        assert_eq!(downloader.tasks().len(), 1);
+        let task = &downloader.tasks()[&0];
+        assert_eq!(task.filename(), "pack.zip");
+        assert_eq!(task.path(), &directory.path().join("resourcepacks"));
+        // 资源目录被自动创建出来。
+        assert!(directory.path().join("resourcepacks").is_dir());
+    }
+
+    /// 序列化其它资源类别：扫描 `shaderpacks` 里的 zip，元数据写到
+    /// `.rev_launcher/shaderpacks`。
+    #[test]
+    fn serialize_resources_shaderpacks_test() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = test_project(directory.path());
+        let shaders = directory.path().join("shaderpacks");
+        std::fs::create_dir_all(&shaders).unwrap();
+        std::fs::write(shaders.join("bsl.zip"), b"shader").unwrap();
+        // jar 不应被 shaderpacks 扫描收进来。
+        std::fs::write(shaders.join("mod.jar"), b"jar").unwrap();
+
+        // 预写一份 sha1 匹配的 toml，让这次序列化跳过网络查询。
+        let sha1 = crate::detective::modrinth::modrinth_sha1_bytes(b"shader");
+        let info = ModInfo {
+            filename: "bsl.zip".into(),
+            sha1,
+            curseforge: None,
+            modrinth: None,
+        };
+        let out_dir = directory.path().join(".rev_launcher/shaderpacks");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(
+            out_dir.join("bsl.zip.toml"),
+            toml_edit::ser::to_string_pretty(&info).unwrap(),
+        )
+        .unwrap();
+
+        let rx = serialize_resources(&project, ResourceKind::Shader).unwrap();
+        let events: Vec<_> = rx.into_iter().collect();
+        assert!(
+            matches!(
+                events.first(),
+                Some(Ok(SerializeModsProgress::WriteStart { total: 1 }))
+            ),
+            "events: {events:?}"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(Ok(SerializeModsProgress::Done { total: 1 }))
+            ),
+            "events: {events:?}"
+        );
     }
 }

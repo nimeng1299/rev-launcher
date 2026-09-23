@@ -1,3 +1,5 @@
+mod resource_dialog;
+
 use std::path::{Path, PathBuf};
 
 use gpui_kit::base::{Disableable, StyledExt, h_flex, v_flex};
@@ -16,7 +18,10 @@ use gpui_kit::{
     SharedString, Styled, Subscription, Task, WeakEntity, Window, div, px, rgb,
 };
 
+use mclib::detective::base::ResourceKind;
 use mclib::project::game_project::{GameProject, ModLoader};
+
+use resource_dialog::ResourceSyncDialog;
 
 use crate::jj;
 use crate::window::project_select::{ProjectList, ProjectSelect, loader_name};
@@ -97,6 +102,15 @@ impl PackKind {
             Self::Mod => "模组",
             Self::ResourcePack => "资源包",
             Self::Shader => "光影",
+        }
+    }
+
+    /// 序列化/反序列化用的资源类别，目录和 ext 跟这里保持一致。
+    fn resource_kind(self) -> ResourceKind {
+        match self {
+            Self::Mod => ResourceKind::Mod,
+            Self::ResourcePack => ResourceKind::ResourcePack,
+            Self::Shader => ResourceKind::Shader,
         }
     }
 }
@@ -500,6 +514,20 @@ impl DevelopPage {
         cx.notify();
     }
 
+    /// 「序列化」/「反序列化」按钮：启动任务并打开进度弹窗。
+    ///
+    /// 任务本身由弹窗负责启动和观察；没选项目（`pack_dir` 为空时按钮也不会渲染，
+    /// 这里是双保险）就什么都不做。
+    fn open_sync_dialog(&mut self, serialize: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.project_select.selected_project().cloned() else {
+            return;
+        };
+        let Some(kind) = PackKind::from_section(self.section) else {
+            return;
+        };
+        ResourceSyncDialog::open(&project, kind, serialize, cx.entity().downgrade(), window, cx);
+    }
+
     /// 勾选框切换：把文件在正常后缀和追加 `.disabled` 之间重命名。
     fn set_pack_enabled(
         &mut self,
@@ -570,6 +598,23 @@ impl DevelopPage {
                         let _ = std::fs::create_dir_all(&pack_dir);
                         cx.reveal_path(&pack_dir);
                     }),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("serialize-packs")
+                    .icon(IconName::ArrowUp)
+                    .label(format!("序列化{noun}"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_sync_dialog(true, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("deserialize-packs")
+                    .icon(IconName::ArrowDown)
+                    .label(format!("反序列化{noun}"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_sync_dialog(false, window, cx);
+                    })),
             );
 
         v_flex()
