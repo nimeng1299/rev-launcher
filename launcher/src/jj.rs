@@ -107,6 +107,62 @@ pub fn git_backend_info<P: AsRef<Path>>(path: P) -> Option<GitBackendInfo> {
     Some(GitBackendInfo { branch })
 }
 
+/// 建仓库时默认写进 `.gitignore` 的条目。
+///
+/// 都是「跑起来才有、不是整合包内容」的东西：启动器自己的日志和解压出来的 natives、
+/// 游戏日志/下载来的 mods/资源包/光影，还有版本目录里的启动 jar 和 json。
+/// 那两个写的是具体名字——版本目录里的 jar/json 跟目录同名（mclib 读版本 json 时
+/// 就是按目录名找 `<目录名>.json`），这样 config/ 这类子目录里的 jar/json 还能照常
+/// 纳入版本管理。
+fn default_ignores(path: &Path) -> Vec<String> {
+    let mut entries = [
+        ".rev_launcher/logs",
+        ".rev_launcher/natives",
+        "logs",
+        "mods",
+        "resourcepacks",
+        "shaderpacks",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+
+    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+        entries.push(format!("{name}.jar"));
+        entries.push(format!("{name}.json"));
+    }
+
+    entries
+}
+
+/// 把默认忽略项补进项目的 `.gitignore`。
+///
+/// 已经存在的行一行都不动，只追加缺的那些，所以重复建仓库（或用户自己已经写过
+/// `.gitignore`）都不会把别人的内容冲掉，也不会重复写。
+fn ensure_default_ignores(path: &Path) -> anyhow::Result<()> {
+    let gitignore_path = path.join(".gitignore");
+    let existing = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+    let missing = default_ignores(path)
+        .into_iter()
+        .filter(|entry| !existing.lines().any(|line| line.trim() == entry))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    for entry in missing {
+        content.push_str(&entry);
+        content.push('\n');
+    }
+
+    std::fs::write(&gitignore_path, content).context("failed to write .gitignore")?;
+    Ok(())
+}
+
 pub fn init_git_backend<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let path = path.as_ref();
     if path.join(".jj").exists() {
@@ -129,6 +185,9 @@ pub fn init_git_backend<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     Workspace::init_external_git(&settings, path, &path.join(".git"))
         .block_on()
         .context("failed to initialize jj workspace with the Git repository")?;
+
+    // 建仓库这一步不快照，所以现在写进去的忽略规则会在下一次快照时生效。
+    ensure_default_ignores(path)?;
 
     Ok(())
 }
@@ -1371,6 +1430,60 @@ mod tests {
 
         // 本仓库就是从 GitHub 上的 origin 克隆出来的，列表里应该有它。
         assert!(remotes.iter().any(|remote| remote == "origin"));
+    }
+
+    #[test]
+    fn default_ignores_are_appended_without_clobbering() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let expected = default_ignores(dir.path());
+
+        // 启动 jar/json 写的是具体名字，不是通配
+        let folder = dir
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("folder name")
+            .to_owned();
+        assert!(expected.contains(&format!("{folder}.jar")));
+        assert!(expected.contains(&format!("{folder}.json")));
+        assert!(!expected.iter().any(|entry| entry.contains('*')));
+
+        // 全新的项目：整份默认忽略都写进去，而且不写注释
+        ensure_default_ignores(dir.path()).expect("write ignores");
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).expect("read");
+        for entry in &expected {
+            assert!(
+                content.lines().any(|line| line.trim() == entry),
+                "缺了 {entry}"
+            );
+        }
+        assert!(!content.contains('#'), "不该往里写注释：{content}");
+
+        // 用户自己写过 .gitignore：原有内容留着，只补缺的，已有的项不重复
+        let dir = tempfile::tempdir().expect("tempdir");
+        let expected = default_ignores(dir.path());
+        std::fs::write(dir.path().join(".gitignore"), "keep-me\nmods\n").expect("write");
+        ensure_default_ignores(dir.path()).expect("write ignores");
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).expect("read");
+        assert!(content.contains("keep-me"), "用户自己的内容不该被冲掉");
+        assert_eq!(
+            content.lines().filter(|line| line.trim() == "mods").count(),
+            1,
+            "已经有的项不该再写一遍"
+        );
+        for entry in &expected {
+            assert!(
+                content.lines().any(|line| line.trim() == entry),
+                "缺了 {entry}"
+            );
+        }
+
+        // 再跑一次应该什么都不变
+        ensure_default_ignores(dir.path()).expect("write ignores again");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".gitignore")).expect("read"),
+            content
+        );
     }
 
     #[test]
