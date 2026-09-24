@@ -2174,7 +2174,7 @@ impl VcsPage {
 const PUSH_PACK_KINDS: [PackKind; 3] = [PackKind::Mod, PackKind::ResourcePack, PackKind::Shader];
 
 /// 改动列表一次显示这么多行，多的用滚轮翻。
-const PUSH_CHANGE_ROWS: f32 = 5.;
+const PUSH_CHANGE_ROWS: usize = 5;
 
 /// 改动列表每行的高度；列表高度是行高乘行数，所以这里得是固定值。
 const PUSH_CHANGE_ROW_HEIGHT: f32 = 22.;
@@ -2395,29 +2395,38 @@ impl PushDialog {
             ChangesState::Loaded(changes) => {
                 let total = changes.total;
                 let shown = changes.files.len();
-                panel =
-                    panel
-                        .child(
-                            Label::new(if total > shown {
-                                format!("改动 {total} 个文件，只列出前 {shown} 个")
-                            } else {
-                                format!("改动 {total} 个文件")
-                            })
-                            .text_sm()
-                            .text_color(muted),
-                        )
-                        .child(
-                            div()
-                                .id("push-changes")
-                                .debug_selector(|| "push-changes".to_owned())
-                                .v_flex()
-                                .w_full()
-                                .max_h(px(PUSH_CHANGE_ROW_HEIGHT * PUSH_CHANGE_ROWS))
-                                .overflow_y_scrollbar()
-                                .children(changes.files.iter().map(|file| {
-                                    change_row(file, muted, added_color, removed_color)
-                                })),
-                        );
+                // 只露五行那么高，多的部分靠滚轮翻；文件少的时候列表就矮一点。
+                let rows = shown.min(PUSH_CHANGE_ROWS);
+                panel = panel
+                    .child(
+                        Label::new(if total > shown {
+                            format!("改动 {total} 个文件，只列出前 {shown} 个")
+                        } else {
+                            format!("改动 {total} 个文件")
+                        })
+                        .text_sm()
+                        .text_color(muted),
+                    )
+                    .child(
+                        // 滚动区域的高度由外面这层定（行高乘行数、最多五行），里面撑满它：
+                        // 高度要是留在内容上，内容自己就被封顶了，那就没得滚。
+                        div()
+                            .debug_selector(|| "push-changes".to_owned())
+                            .w_full()
+                            .h(px(PUSH_CHANGE_ROW_HEIGHT * rows as f32))
+                            .child(
+                                div().size_full().overflow_y_scrollbar().child(
+                                    div()
+                                        .debug_selector(|| "push-changes-content".to_owned())
+                                        .size_full()
+                                        .child(div().v_flex().w_full().children(
+                                            changes.files.iter().map(|file| {
+                                                change_row(file, muted, added_color, removed_color)
+                                            }),
+                                        )),
+                                ),
+                            ),
+                    );
             }
         }
 
@@ -2455,6 +2464,7 @@ fn change_row(
     };
 
     h_flex()
+        .flex_shrink_0()
         .h(px(PUSH_CHANGE_ROW_HEIGHT))
         .w_full()
         .min_w_0()
@@ -2586,7 +2596,7 @@ impl Render for VcsPage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui_kit::TestAppContext;
+    use gpui_kit::{TestAppContext, VisualTestContext};
     use mclib::project::game_project::ModLoader;
 
     fn commit(id: &str, parents: &[&str]) -> jj::CommitHistoryItem {
@@ -2742,7 +2752,7 @@ mod tests {
 
     /// 改动比列表能显示的多时，列表高度得停在五行上，剩下的靠滚轮翻。
     #[gpui_kit::test]
-    fn push_dialog_caps_the_change_list_at_five_rows(cx: &mut TestAppContext) {
+    fn push_dialog_caps_the_change_list_at_five_rows_and_scrolls(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2764,20 +2774,47 @@ mod tests {
         let (_, cx) = cx.add_window_view(|window, cx| PushDialogHost {
             content: cx.new(|cx| PushDialog::new(project, Rc::new(|_, _| {}), window, cx)),
         });
-        // 等后台那次「数改动」落地，再画一遍。
+        // 等后台那次「数改动」落地，再画两遍。
+        draw(cx);
         cx.run_until_parked();
+        draw(cx);
+
+        let list = cx.debug_bounds("push-changes").expect("改动列表应该在");
+        assert_eq!(
+            list.size.height,
+            px(PUSH_CHANGE_ROW_HEIGHT * PUSH_CHANGE_ROWS as f32),
+            "列表正好露 {PUSH_CHANGE_ROWS} 行"
+        );
+
+        // 在列表上滚一格：里面的内容得跟着往上走，否则就是高度封在内容上、根本没得滚。
+        let before = cx
+            .debug_bounds("push-changes-content")
+            .expect("列表内容应该在")
+            .origin
+            .y;
+        scroll(cx, list.center(), -60.);
+        let after = cx
+            .debug_bounds("push-changes-content")
+            .expect("列表内容应该在")
+            .origin
+            .y;
+        assert!(after < before, "滚轮要把列表滚上去：{before} → {after}");
+    }
+
+    /// 画一帧。
+    fn draw(cx: &mut VisualTestContext) {
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
-        cx.run_until_parked();
+    }
 
-        let list = cx.debug_bounds("push-changes").expect("改动列表应该在");
-        assert!(list.size.height > px(0.));
-        assert!(
-            list.size.height <= px(PUSH_CHANGE_ROW_HEIGHT * PUSH_CHANGE_ROWS + 1.),
-            "列表最多显示 {} 行，实际 {}px",
-            PUSH_CHANGE_ROWS,
-            list.size.height
-        );
+    /// 在窗口里的某个位置滚一下滚轮。
+    fn scroll(cx: &mut VisualTestContext, position: gpui_kit::Point<gpui_kit::Pixels>, dy: f32) {
+        cx.simulate_event(gpui_kit::ScrollWheelEvent {
+            position,
+            delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(dy))),
+            ..Default::default()
+        });
+        draw(cx);
     }
 }
