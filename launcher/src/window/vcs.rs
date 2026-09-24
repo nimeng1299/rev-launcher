@@ -540,6 +540,12 @@ impl ListDelegate for CommitListDelegate {
         let disabled = self.disabled;
         let drop_page = self.page.clone();
         let drop_commit_id = commit.id.clone();
+        // 选中的那一项（不是这一行时）就是 ctrl+右键合并的对象。
+        let selected_commit_id = self
+            .selected_index
+            .filter(|selected| *selected != ix)
+            .and_then(|selected| self.commits.get(selected.row))
+            .map(|commit| commit.id.clone());
         let mut bookmark_elements = h_flex().flex_none().gap_1();
         for bookmark in &commit.bookmarks {
             bookmark_elements = bookmark_elements.child(bookmark_element(bookmark, disabled));
@@ -587,9 +593,33 @@ impl ListDelegate for CommitListDelegate {
                         // 菜单挂在行内容上：`render_item` 只能返回 `ListItem`，
                         // 而 `.context_menu(..)` 会把它换成 `ContextMenu`。
                         .id(("commit-menu", ix.row))
-                        .context_menu(move |menu, _, _| {
+                        .context_menu(move |menu, window, _cx| {
                             if disabled {
                                 return menu;
+                            }
+
+                            // 选中了一项，再按住 ctrl 右键点另一项：菜单换成只有 merge。
+                            if window.modifiers().control
+                                && let Some(selected_commit_id) = selected_commit_id.clone()
+                            {
+                                let page = context_page.clone();
+                                let first_parent = context_commit_id.clone();
+                                return menu.item(
+                                    PopupMenuItem::new("合并选中的提交（merge）")
+                                        .icon(IconName::Network)
+                                        .on_click(move |_, window, cx| {
+                                            let second_parent = selected_commit_id.clone();
+                                            let first_parent = first_parent.clone();
+                                            let _ = page.update(cx, |page, cx| {
+                                                page.merge_commits(
+                                                    first_parent,
+                                                    second_parent,
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }),
+                                );
                             }
 
                             let new_page = context_page.clone();
@@ -731,7 +761,7 @@ impl RemoteCommand {
 /// 页面上正在跑的仓库操作。
 ///
 /// 同一时刻只允许一个：切换提交、移动 bookmark、拉取、推送、建仓库、新建提交、
-/// 提交工作副本都会改工作副本或者仓库状态，串起来才不会互相踩。
+/// 提交工作副本、合并都会改工作副本或者仓库状态，串起来才不会互相踩。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VcsOperation {
     Checkout,
@@ -740,6 +770,16 @@ enum VcsOperation {
     CreateRepo,
     NewCommit,
     CommitWorkingCopy,
+    Merge,
+}
+
+/// 操作失败时怎么把原因说出来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorReporting {
+    /// 弹一条通知：操作本身简单，失败原因一般也就一行。
+    Notification,
+    /// 弹一个对话框：失败原因可能比较长，用户得看完再决定怎么办。
+    Dialog(&'static str),
 }
 
 /// 远程列表更新后该选中哪个：原来选中的还在就用它，否则退回第一个。
@@ -1215,6 +1255,7 @@ impl VcsPage {
                     .map_err(|error| format!("新建提交失败：{error}"))
             },
             move |new_commit_id| format!("已在 {parent} 上新建提交 {:.8}", new_commit_id),
+            ErrorReporting::Notification,
             window,
             cx,
         );
@@ -1334,18 +1375,50 @@ impl VcsPage {
                     .map_err(|error| format!("提交工作副本失败：{error}"))
             },
             move |_| summary,
+            ErrorReporting::Notification,
             window,
             cx,
         );
     }
 
-    /// 图上两个操作（新建提交、提交工作副本）共用的一条流程：
+    /// 把选中的那一项合并到右键点的那一项上：新建一个合并提交并切过去。
+    ///
+    /// 两边都改过的文件会留下冲突，交给用户之后处理。
+    fn merge_commits(
+        &mut self,
+        first_parent: String,
+        second_parent: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let short_first = format!("{:.8}", first_parent);
+        let short_second = format!("{:.8}", second_parent);
+        self.run_commit_op(
+            VcsOperation::Merge,
+            move |path| {
+                jj::merge_commits(&path, &first_parent, &second_parent)
+                    .map_err(|error| format!("合并失败：{error}"))
+            },
+            move |new_commit_id| {
+                format!(
+                    "已合并 {short_first} 和 {short_second}，新提交 {:.8}",
+                    new_commit_id
+                )
+            },
+            ErrorReporting::Dialog("合并失败"),
+            window,
+            cx,
+        );
+    }
+
+    /// 图上几个操作（新建提交、提交工作副本、合并）共用的一条流程：
     /// 锁住页面、后台跑 jj-lib、重读历史、成功后弹通知。
     fn run_commit_op(
         &mut self,
         operation: VcsOperation,
         action: impl FnOnce(std::path::PathBuf) -> Result<String, String> + Send + 'static,
         message: impl FnOnce(&str) -> String + Send + 'static,
+        error_reporting: ErrorReporting,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1406,13 +1479,60 @@ impl VcsPage {
                         );
                     }
                     // 失败时历史本身还是好的，列表留着不动，只把原因说出来。
-                    Err(error) => {
-                        window.push_notification((NotificationType::Error, error), cx);
-                    }
+                    Err(error) => match error_reporting {
+                        ErrorReporting::Notification => {
+                            window.push_notification((NotificationType::Error, error), cx);
+                        }
+                        ErrorReporting::Dialog(title) => {
+                            page.open_error_dialog(title.to_owned(), error, window, cx);
+                        }
+                    },
                 }
             });
         })
         .detach();
+    }
+
+    /// 用对话框把错误说清楚。
+    ///
+    /// 合并这类操作的失败原因可能比较长，一条通知容易被划过去；已经有弹窗时就退回
+    /// 通知，免得把用户正在看的窗口盖掉。
+    fn open_error_dialog(
+        &mut self,
+        title: String,
+        message: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx) {
+            window.push_notification((NotificationType::Error, message), cx);
+            return;
+        }
+
+        let muted = cx.theme().muted_foreground;
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            dialog
+                .title(title.clone())
+                .overlay_closable(true)
+                .footer(
+                    h_flex().w_full().justify_end().child(
+                        Button::new("error-close")
+                            .label("关闭")
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    ),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_2()
+                        .child(Label::new(message.clone()))
+                        .child(
+                            Label::new("提交图在那里，可以对照着看看仓库现在的状态。")
+                                .text_sm()
+                                .text_color(muted),
+                        ),
+                )
+        });
     }
 
     /// 推送所有本地 bookmark 到当前远程。

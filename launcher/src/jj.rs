@@ -25,7 +25,7 @@ use jj_lib::revset::{
     ResolvedRevsetExpression, RevsetAliasesMap, RevsetDiagnostics, RevsetExtensions,
     RevsetParseContext, RevsetWorkspaceContext, SymbolResolver, parse, parse_string_expression,
 };
-use jj_lib::rewrite::RebaseOptions;
+use jj_lib::rewrite::{RebaseOptions, merge_commit_trees};
 use jj_lib::settings::RemoteSettingsMap;
 use jj_lib::str_util::{StringExpression, StringMatcher};
 use jj_lib::time_util::DatePatternContext;
@@ -849,6 +849,67 @@ pub fn working_copy_description<P: AsRef<Path>>(path: P) -> anyhow::Result<Optio
         .to_owned();
 
     Ok((!description.trim().is_empty()).then_some(description))
+}
+
+/// 合并两个提交：新建一个以它们为父的合并提交，并把工作副本切过去（`jj new A B`）。
+///
+/// 两边都改过的文件会留下冲突（和 jj 一样，冲突交给用户之后处理）。`first_parent`
+/// 是右键点的那一项，也就是合并的落点；`second_parent` 是列表里选中的那一项。
+pub fn merge_commits<P: AsRef<Path>>(
+    path: P,
+    first_parent: &str,
+    second_parent: &str,
+) -> anyhow::Result<String> {
+    let path = path.as_ref();
+    let mut workspace = load_workspace(path)?;
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .block_on()
+        .context("failed to load repository")?;
+    let first_id = parse_commit_id(first_parent)?;
+    let second_id = parse_commit_id(second_parent)?;
+    if first_id == second_id {
+        anyhow::bail!("不能把提交和自己合并");
+    }
+    let first = repo
+        .store()
+        .get_commit(&first_id)
+        .context("commit does not exist")?;
+    let second = repo
+        .store()
+        .get_commit(&second_id)
+        .context("commit does not exist")?;
+
+    let tree = merge_commit_trees(repo.as_ref(), &[first, second])
+        .block_on()
+        .context("failed to merge the two trees")?;
+
+    let mut transaction = repo.start_transaction();
+    let new_commit = transaction
+        .repo_mut()
+        .new_commit(vec![first_id.clone(), second_id.clone()], tree)
+        .write()
+        .block_on()
+        .context("failed to create the merge commit")?;
+    transaction
+        .repo_mut()
+        .edit(workspace.workspace_name().to_owned(), &new_commit)
+        .block_on()
+        .context("failed to select the merge commit")?;
+    // 合并提交自己可能挤掉原来的空工作副本提交，提交事务前统一兜一次 rebase。
+    rebase_rewritten_descendants(&mut transaction, &repo, &workspace, path)?;
+    let repo = transaction
+        .commit(format!("merge {first_id} and {second_id}"))
+        .block_on()
+        .context("failed to save the merge commit")?;
+
+    let new_commit = working_copy_commit(&repo, &workspace)?;
+    workspace
+        .check_out(repo.op_id().clone(), None, &new_commit)
+        .block_on()
+        .context("failed to update working copy")?;
+    Ok(new_commit.id().to_string())
 }
 
 pub fn move_local_bookmark<P: AsRef<Path>>(
