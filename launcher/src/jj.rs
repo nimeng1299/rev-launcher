@@ -912,6 +912,29 @@ pub fn merge_commits<P: AsRef<Path>>(
     Ok(new_commit.id().to_string())
 }
 
+/// 添加一个远程仓库（`jj git remote add <name> <url>`）。
+///
+/// 名字/地址不合法、或者同名远程已经存在，都会以错误返回（错误信息来自 jj-lib）。
+pub fn add_remote<P: AsRef<Path>>(path: P, name: &str, url: &str) -> anyhow::Result<()> {
+    let workspace = load_workspace(path.as_ref())?;
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .block_on()
+        .context("failed to load repository")?;
+    let remote_name = RemoteName::new(name);
+
+    let mut transaction = repo.start_transaction();
+    // 这一步除了往 git config 写 `[remote "<name>"]`，还会在仓库视图里登记这个远程，
+    // 所以事务得落盘，不然视图和 git config 就对不上了。
+    jj_lib::git::add_remote(transaction.repo_mut(), remote_name, url, None)?;
+    transaction
+        .commit(format!("add git remote {name}"))
+        .block_on()
+        .context("failed to save the new remote")?;
+    Ok(())
+}
+
 pub fn move_local_bookmark<P: AsRef<Path>>(
     path: P,
     bookmark_name: &str,

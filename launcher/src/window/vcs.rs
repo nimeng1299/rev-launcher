@@ -4,6 +4,7 @@ use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListItem, ListState};
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_kit::component::notification::NotificationType;
+use gpui_kit::component::searchable_list::SearchableListItem;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{
@@ -771,6 +772,7 @@ enum VcsOperation {
     NewCommit,
     CommitWorkingCopy,
     Merge,
+    AddRemote,
 }
 
 /// 操作失败时怎么把原因说出来。
@@ -796,18 +798,77 @@ fn remote_index(remotes: &[String], remote: Option<&String>) -> Option<IndexPath
         .map(IndexPath::new)
 }
 
+/// 远程下拉框里的一项：某个远程仓库，或者最后那项「添加远程仓库」。
+///
+/// 和版本管理页的路径下拉框一样：把「加一个新的」也放进列表里，而不是单挂一个按钮。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteOption {
+    Remote(String),
+    AddRemote,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteOptionItem {
+    value: RemoteOption,
+    label: SharedString,
+}
+
+impl SearchableListItem for RemoteOptionItem {
+    type Value = RemoteOption;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.value
+    }
+
+    /// 「添加远程仓库」那项带个加号，和普通远程区分开。
+    fn render(&self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        match &self.value {
+            RemoteOption::Remote(_) => Label::new(self.label.clone()).into_any_element(),
+            RemoteOption::AddRemote => h_flex()
+                .items_center()
+                .gap_2()
+                .child(Icon::new(IconName::Plus).size(px(14.)))
+                .child(Label::new(self.label.clone()))
+                .into_any_element(),
+        }
+    }
+}
+
+/// 把远程列表转成下拉框选项，末尾补上「添加远程仓库」。
+fn remote_option_items(remotes: &[String]) -> Vec<RemoteOptionItem> {
+    let mut items = remotes
+        .iter()
+        .map(|name| RemoteOptionItem {
+            value: RemoteOption::Remote(name.clone()),
+            label: SharedString::from(name.clone()),
+        })
+        .collect::<Vec<_>>();
+    items.push(RemoteOptionItem {
+        value: RemoteOption::AddRemote,
+        label: SharedString::from("添加远程仓库…"),
+    });
+
+    items
+}
+
 pub struct VcsPage {
     commit_state: Entity<ListState<CommitListDelegate>>,
     /// 项目下拉框，和启动页共用一份实现；选中项写回设置，两个页面自然同步。
     project_select: ProjectSelect,
     /// 保活项目下拉框的事件订阅。
     _select_subscription: Subscription,
-    /// 远程仓库下拉框，选项是当前项目的 git remote。
-    remote_select: Entity<SelectState<Vec<String>>>,
+    /// 远程仓库下拉框，选项是当前项目的 git remote，末尾还挂着「添加远程仓库」。
+    remote_select: Entity<SelectState<Vec<RemoteOptionItem>>>,
     /// 保活远程下拉框的事件订阅。
     _remote_subscription: Subscription,
     /// 当前选中的远程名，拉取和推送都作用在它上面。
     selected_remote: Option<String>,
+    /// 当前项目的远程列表，和下拉框里的选项一致；加远程时用来查重和预填。
+    remotes: Vec<String>,
     /// 远程列表的请求号：换项目后，早先那次读远程的结果就作废了。
     remotes_request_id: u64,
     revset: String,
@@ -846,16 +907,33 @@ impl VcsPage {
         let remote_subscription = cx.subscribe_in(
             &remote_select,
             window,
-            |page: &mut Self, _state, event: &SelectEvent<Vec<String>>, _window, cx| {
-                let SelectEvent::Confirm(Some(remote)) = event else {
+            |page: &mut Self, _state, event: &SelectEvent<Vec<RemoteOptionItem>>, window, cx| {
+                let SelectEvent::Confirm(Some(option)) = event else {
                     return;
                 };
-                if page.selected_remote.as_ref() == Some(remote) {
-                    return;
-                }
 
-                page.selected_remote = Some(remote.clone());
-                cx.notify();
+                match option {
+                    RemoteOption::Remote(remote) => {
+                        if page.selected_remote.as_ref() == Some(remote) {
+                            return;
+                        }
+
+                        page.selected_remote = Some(remote.clone());
+                        cx.notify();
+                    }
+                    // 「添加远程仓库」不是真的远程：把下拉框拨回当前选中的那个，再弹添加框。
+                    // 此刻还在 SelectState 自己的更新栈上，直接回头改它会重入更新，
+                    // 所以推到本轮效果跑完后再做。
+                    RemoteOption::AddRemote => {
+                        let index = remote_index(&page.remotes, page.selected_remote.as_ref());
+                        cx.defer_in(window, move |page, window, cx| {
+                            page.remote_select.update(cx, |state, cx| {
+                                state.set_selected_index(index, window, cx);
+                            });
+                            page.open_add_remote_dialog(window, cx);
+                        });
+                    }
+                }
             },
         );
 
@@ -886,6 +964,7 @@ impl VcsPage {
             remote_select,
             _remote_subscription: remote_subscription,
             selected_remote: None,
+            remotes: Vec::new(),
             remotes_request_id: 0,
             revset,
             revset_input,
@@ -1072,10 +1151,11 @@ impl VcsPage {
     fn set_remotes(&mut self, remotes: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         let selected = resolve_remote(&remotes, self.selected_remote.clone());
         self.selected_remote = selected.clone();
+        self.remotes = remotes.clone();
 
         let index = remote_index(&remotes, selected.as_ref());
         self.remote_select.update(cx, |state, cx| {
-            state.set_items(remotes, window, cx);
+            state.set_items(remote_option_items(&remotes), window, cx);
             state.set_selected_index(index, window, cx);
         });
     }
@@ -1700,6 +1780,192 @@ impl VcsPage {
         })
         .detach();
     }
+
+    /// 添加远程仓库的弹窗：填名字和地址。
+    fn open_add_remote_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.operation.is_some() || window.has_active_dialog(cx) {
+            return;
+        }
+
+        let Some(path) = self.project_select.selected_path().cloned() else {
+            window.push_notification(
+                (NotificationType::Error, "当前没有选中的整合包".to_owned()),
+                cx,
+            );
+            return;
+        };
+        if !jj::is_repo(&path) {
+            window.push_notification(
+                (
+                    NotificationType::Error,
+                    "项目还不是仓库，先创建仓库".to_owned(),
+                ),
+                cx,
+            );
+            return;
+        }
+
+        // origin 是最常见的名字，已经有了就不预填，免得一上来就撞名。
+        let default_name = if self.remotes.iter().any(|remote| remote == "origin") {
+            String::new()
+        } else {
+            "origin".to_owned()
+        };
+        let name_is_prefilled = !default_name.is_empty();
+        let name_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(default_name)
+                .placeholder("名字，例如 origin")
+        });
+        let url_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("地址，例如 https://github.com/user/repo.git")
+        });
+        let muted = cx.theme().muted_foreground;
+        let known_remotes = self.remotes.clone();
+        // 名字已经填好的话，光标直接落到地址上；否则先填名字。
+        let focus_input = if name_is_prefilled {
+            url_input.clone()
+        } else {
+            name_input.clone()
+        };
+
+        let page = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let page = page.clone();
+            let name_input = name_input.clone();
+            let url_input = url_input.clone();
+            let known_remotes = known_remotes.clone();
+            dialog
+                .title("添加远程仓库")
+                .overlay_closable(true)
+                .footer(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("add-remote-cancel")
+                                .label("取消")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(Button::new("add-remote-confirm").label("添加").on_click({
+                            let page = page.clone();
+                            let known_remotes = known_remotes.clone();
+                            // 弹窗正文里还要用这两个输入框，这里再拿一份。
+                            let name_input = name_input.clone();
+                            let url_input = url_input.clone();
+                            move |_, window, cx| {
+                                let name = name_input.read(cx).value().trim().to_owned();
+                                let url = url_input.read(cx).value().trim().to_owned();
+
+                                // 能在本地判掉的就不去后台绕一圈：弹窗留着，方便接着改。
+                                if name.is_empty() || url.is_empty() {
+                                    window.push_notification(
+                                        (NotificationType::Error, "名字和地址都要填".to_owned()),
+                                        cx,
+                                    );
+                                    return;
+                                }
+                                if known_remotes.iter().any(|remote| remote == &name) {
+                                    window.push_notification(
+                                        (
+                                            NotificationType::Error,
+                                            format!("远程仓库 {name} 已经存在"),
+                                        ),
+                                        cx,
+                                    );
+                                    return;
+                                }
+
+                                window.close_dialog(cx);
+                                let _ = page.update(cx, |page, cx| {
+                                    page.add_remote(name, url, window, cx);
+                                });
+                            }
+                        })),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_2()
+                        .child(Label::new(
+                            "给项目加一个远程仓库，之后就能在工具栏里拉取和推送它。",
+                        ))
+                        .child(Input::new(&name_input).w_full())
+                        .child(Input::new(&url_input).w_full())
+                        .child(
+                            Label::new("名字里不能带斜杠，也不能用 jj 保留的 git。")
+                                .text_sm()
+                                .text_color(muted),
+                        ),
+                )
+        });
+
+        // 弹窗这一帧过后再聚焦，光标直接落在该填的那个框里。
+        cx.defer_in(window, move |_page, window, cx| {
+            focus_input.update(cx, |state, cx| state.focus(window, cx));
+        });
+    }
+
+    /// 真正去加远程仓库，加完重读远程列表并选中它。
+    fn add_remote(
+        &mut self,
+        name: String,
+        url: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.operation.is_some() {
+            return;
+        }
+
+        let Some(path) = self.project_select.selected_path().cloned() else {
+            window.push_notification(
+                (NotificationType::Error, "当前没有选中的整合包".to_owned()),
+                cx,
+            );
+            return;
+        };
+
+        self.operation = Some(VcsOperation::AddRemote);
+        cx.notify();
+
+        let notification_name = name.clone();
+        let page = cx.entity().downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { jj::add_remote(&path, &name, &url) })
+                .await;
+
+            let _ = page.update_in(cx, |page, window, cx| {
+                page.operation = None;
+                match result {
+                    Ok(()) => {
+                        // 新加的直接选中，省得用户再去下拉框里找一遍。
+                        page.selected_remote = Some(notification_name.clone());
+                        page.reload_remotes(window, cx);
+                        window.push_notification(
+                            (
+                                NotificationType::Success,
+                                format!("已添加远程仓库 {notification_name}"),
+                            ),
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        page.open_error_dialog(
+                            "添加远程仓库失败".to_owned(),
+                            error.to_string(),
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            });
+        })
+        .detach();
+    }
 }
 
 impl Render for VcsPage {
@@ -1738,7 +2004,7 @@ impl Render for VcsPage {
                     ),
             )
             .child(
-                // 远程操作工具栏：远程仓库下拉框 + 拉取 + 推送。
+                // 远程操作工具栏：远程仓库下拉框（末尾带「添加远程仓库」）+ 拉取 + 推送。
                 h_flex()
                     .w_full()
                     .items_center()
