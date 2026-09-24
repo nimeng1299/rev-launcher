@@ -1,11 +1,14 @@
 use gpui_kit::component::button::Button;
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListItem, ListState};
+use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::tag::Tag;
-use gpui_kit::component::{ActiveTheme, Disableable, IndexPath, StyledExt, WindowExt, h_flex};
+use gpui_kit::component::{
+    ActiveTheme, Disableable, Icon, IconName, IndexPath, StyledExt, WindowExt, h_flex,
+};
 use gpui_kit::{
     AnyElement, App, AppContext, ClickEvent, Context, Entity, Hsla, InteractiveElement,
     IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
@@ -342,6 +345,77 @@ fn bookmark_element(bookmark: &jj::Bookmark, disabled: bool) -> AnyElement {
     element.into_any_element()
 }
 
+/// 项目还不是 jj 仓库时，列表位置显示的大框：整块都能点，点了就在项目里建仓库。
+fn create_repo_box(page: WeakEntity<VcsPage>, cx: &App) -> AnyElement {
+    // 颜色先取出来：hover 的样式闭包不能借用 cx。
+    let muted = cx.theme().muted_foreground;
+    let hover_color = cx.theme().accent.opacity(0.35);
+
+    div()
+        .id("create-repo")
+        .size_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .cursor_pointer()
+        .hover(move |style| style.bg(hover_color))
+        .on_click(move |_, window, cx| {
+            let _ = page.update(cx, |page, cx| page.create_repo(window, cx));
+        })
+        .child(Icon::new(IconName::Plus).size(px(28.)).text_color(muted))
+        .child(Label::new("当前整合包还不是 jj 仓库"))
+        .child(
+            Label::new("点击这里为它创建仓库，之后就能在启动器里管理版本")
+                .text_sm()
+                .text_color(muted),
+        )
+        .into_any_element()
+}
+
+/// 提交列表空着的时候显示什么。
+///
+/// 「还不是 jj 仓库」要单独认出来：它不是错误，而是给用户一个创建仓库的入口。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EmptyState {
+    /// 正在读历史。
+    Loading,
+    /// 没有选中的整合包。
+    NoProject,
+    /// 项目还不是 jj 仓库：列表位置换成「创建仓库」的大框。
+    NotARepo,
+    /// 正在给项目建仓库。
+    CreatingRepo,
+    /// 仓库是好的，但没有提交可以显示。
+    NoCommits,
+    /// 出错了，把原因显示出来。
+    Failure(String),
+}
+
+impl EmptyState {
+    /// 不是「创建仓库」入口时，列表中间显示的那句话。
+    fn message(&self) -> &str {
+        match self {
+            Self::Loading => "正在读取提交历史…",
+            Self::NoProject => "当前没有选中的整合包",
+            Self::CreatingRepo => "正在创建仓库…",
+            Self::Failure(message) => message,
+            Self::NotARepo | Self::NoCommits => "当前整合包没有历史提交",
+        }
+    }
+}
+
+/// 后台读历史的结果。
+///
+/// `load_history` 失败时要再看一眼项目里到底有没有仓库：没有仓库是正常情况，
+/// 页面上要显示创建入口，而不是把它当成读历史出错。
+enum HistoryLoad {
+    Loaded(jj::CommitHistory),
+    NotARepo,
+    Failed(anyhow::Error),
+}
+
 struct CommitListDelegate {
     commits: Vec<jj::CommitHistoryItem>,
     graph_rows: Vec<GraphRow>,
@@ -349,7 +423,7 @@ struct CommitListDelegate {
     commit_id_prefixes: Vec<usize>,
     working_copy_commit_id: Option<String>,
     selected_index: Option<IndexPath>,
-    error: Option<String>,
+    empty: EmptyState,
     disabled: bool,
     page: WeakEntity<VcsPage>,
 }
@@ -363,7 +437,7 @@ impl CommitListDelegate {
             commit_id_prefixes: Vec::new(),
             working_copy_commit_id: None,
             selected_index: None,
-            error: None,
+            empty: EmptyState::Loading,
             disabled: false,
             page,
         }
@@ -376,29 +450,42 @@ impl CommitListDelegate {
         }
     }
 
-    fn set_loading(&mut self) {
+    /// 清空列表，把状态换成 `empty`。
+    fn reset(&mut self, empty: EmptyState) {
         self.commits.clear();
         self.graph_rows.clear();
         self.change_id_prefixes.clear();
         self.commit_id_prefixes.clear();
         self.working_copy_commit_id = None;
         self.selected_index = None;
-        self.error = Some("正在读取提交历史…".to_owned());
+        self.empty = empty;
+    }
+
+    fn set_loading(&mut self) {
+        self.reset(EmptyState::Loading);
     }
 
     fn set_no_project(&mut self) {
-        self.commits.clear();
-        self.graph_rows.clear();
-        self.change_id_prefixes.clear();
-        self.commit_id_prefixes.clear();
-        self.working_copy_commit_id = None;
-        self.selected_index = None;
-        self.error = Some("当前没有选中的整合包".to_owned());
+        self.reset(EmptyState::NoProject);
+    }
+
+    fn set_not_a_repo(&mut self) {
+        self.reset(EmptyState::NotARepo);
+    }
+
+    fn set_creating_repo(&mut self) {
+        self.reset(EmptyState::CreatingRepo);
+    }
+
+    /// 操作失败：原因留在列表位置上，通知里也会说一遍。
+    fn set_failure(&mut self, message: String) {
+        self.reset(EmptyState::Failure(message));
     }
 
     fn set_history_result(&mut self, result: anyhow::Result<jj::CommitHistory>) {
         match result {
             Ok(history) => {
+                self.reset(EmptyState::NoCommits);
                 self.graph_rows = graph_rows(&history.commits);
                 self.commits = history.commits;
                 self.change_id_prefixes = unique_prefix_lengths(
@@ -416,17 +503,9 @@ impl CommitListDelegate {
                         .collect::<Vec<_>>(),
                 );
                 self.working_copy_commit_id = history.working_copy_commit_id;
-                self.selected_index = None;
-                self.error = None;
             }
             Err(error) => {
-                self.commits.clear();
-                self.graph_rows.clear();
-                self.change_id_prefixes.clear();
-                self.commit_id_prefixes.clear();
-                self.working_copy_commit_id = None;
-                self.selected_index = None;
-                self.error = Some(format!("不是 jj 仓库或无法读取提交历史：{error}"));
+                self.set_failure(format!("读取提交历史失败：{error}"));
             }
         }
     }
@@ -449,6 +528,9 @@ impl ListDelegate for CommitListDelegate {
         let graph_row = self.graph_rows.get(ix.row)?.clone();
         let page = self.page.clone();
         let commit_id = commit.id.clone();
+        // 右键菜单自己拿一份，别和双击切换提交抢同一个值。
+        let context_page = self.page.clone();
+        let context_commit_id = commit.id.clone();
         let is_current = self.working_copy_commit_id.as_ref() == Some(&commit.id);
         let normal_id_color = cx.theme().muted_foreground;
         let change_id_prefix_length = self.change_id_prefixes.get(ix.row).copied().unwrap_or(0);
@@ -501,6 +583,38 @@ impl ListDelegate for CommitListDelegate {
                 .selected(Some(ix) == self.selected_index)
                 .child(
                     h_flex()
+                        // 右键这一行打开菜单：在它上面新建提交，或者提交当前工作副本。
+                        // 菜单挂在行内容上：`render_item` 只能返回 `ListItem`，
+                        // 而 `.context_menu(..)` 会把它换成 `ContextMenu`。
+                        .id(("commit-menu", ix.row))
+                        .context_menu(move |menu, _, _| {
+                            if disabled {
+                                return menu;
+                            }
+
+                            let new_page = context_page.clone();
+                            let new_commit_id = context_commit_id.clone();
+                            let dialog_page = context_page.clone();
+                            menu.item(
+                                PopupMenuItem::new("新建提交（new）")
+                                    .icon(IconName::Plus)
+                                    .on_click(move |_, window, cx| {
+                                        let commit_id = new_commit_id.clone();
+                                        let _ = new_page.update(cx, |page, cx| {
+                                            page.start_new_commit(commit_id, window, cx);
+                                        });
+                                    }),
+                            )
+                            .item(
+                                PopupMenuItem::new("提交工作副本（commit）")
+                                    .icon(IconName::CircleCheck)
+                                    .on_click(move |_, window, cx| {
+                                        let _ = dialog_page.update(cx, |page, cx| {
+                                            page.open_commit_dialog(window, cx);
+                                        });
+                                    }),
+                            )
+                        })
                         .w_full()
                         .h(px(GRAPH_ROW_HEIGHT))
                         .items_center()
@@ -565,18 +679,22 @@ impl ListDelegate for CommitListDelegate {
     fn render_empty(
         &mut self,
         _window: &mut Window,
-        _cx: &mut Context<ListState<Self>>,
+        cx: &mut Context<ListState<Self>>,
     ) -> impl IntoElement {
-        div()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(Label::new(
-                self.error
-                    .clone()
-                    .unwrap_or_else(|| "当前整合包没有历史提交".to_owned()),
-            ))
+        match &self.empty {
+            // 项目还不是仓库：整个列表区域就是一个大按钮，点一下建仓库。
+            EmptyState::NotARepo => create_repo_box(self.page.clone(), cx),
+            empty => {
+                let message = empty.message().to_owned();
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(Label::new(message))
+                    .into_any_element()
+            }
+        }
     }
 
     fn set_selected_index(
@@ -612,13 +730,16 @@ impl RemoteCommand {
 
 /// 页面上正在跑的仓库操作。
 ///
-/// 同一时刻只允许一个：切换提交、移动 bookmark、拉取、推送都会改工作副本或者仓库
-/// 状态，串起来才不会互相踩。
+/// 同一时刻只允许一个：切换提交、移动 bookmark、拉取、推送、建仓库、新建提交、
+/// 提交工作副本都会改工作副本或者仓库状态，串起来才不会互相踩。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VcsOperation {
     Checkout,
     MoveBookmark,
     Remote(RemoteCommand),
+    CreateRepo,
+    NewCommit,
+    CommitWorkingCopy,
 }
 
 /// 远程列表更新后该选中哪个：原来选中的还在就用它，否则退回第一个。
@@ -759,16 +880,119 @@ impl VcsPage {
         cx.spawn_in(window, async move |_, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { jj::load_history(path, &revset) })
+                .spawn(async move {
+                    match jj::load_history(&path, &revset) {
+                        Ok(history) => HistoryLoad::Loaded(history),
+                        // 读不到就再看一眼项目里到底有没有仓库：没有仓库是正常情况，
+                        // 页面上要显示创建入口，别当成读历史出错。
+                        Err(error) => {
+                            if jj::is_repo(&path) {
+                                HistoryLoad::Failed(error)
+                            } else {
+                                HistoryLoad::NotARepo
+                            }
+                        }
+                    }
+                })
                 .await;
             let _ = page.update(cx, |page, cx| {
                 if page.history_request_id != request_id {
                     return;
                 }
                 page.commit_state.update(cx, |state, cx| {
-                    state.delegate_mut().set_history_result(result);
+                    match result {
+                        HistoryLoad::Loaded(history) => {
+                            state.delegate_mut().set_history_result(Ok(history));
+                        }
+                        HistoryLoad::NotARepo => state.delegate_mut().set_not_a_repo(),
+                        HistoryLoad::Failed(error) => {
+                            state.delegate_mut().set_history_result(Err(error));
+                        }
+                    }
                     cx.notify();
                 });
+            });
+        })
+        .detach();
+    }
+
+    /// 给当前项目建一个 jj 仓库（Git 后端），建完就能正常看历史、拉取、推送。
+    ///
+    /// 入口是列表位置那个大框：项目还不是仓库时才会出现。
+    fn create_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.operation.is_some() {
+            return;
+        }
+
+        let Some(path) = self.project_select.selected_path().cloned() else {
+            window.push_notification(
+                (NotificationType::Error, "当前没有选中的整合包".to_owned()),
+                cx,
+            );
+            return;
+        };
+
+        self.operation = Some(VcsOperation::CreateRepo);
+        // 还在飞的那次「读历史」读的是建仓库之前的状态，作废掉。
+        self.history_request_id = self.history_request_id.wrapping_add(1);
+        let request_id = self.history_request_id;
+        self.commit_state.update(cx, |state, cx| {
+            state.delegate_mut().set_creating_repo();
+            cx.notify();
+        });
+
+        let revset = self.revset.clone();
+        let page = cx.entity().downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            // 显式写出返回类型：成功分支是（远程列表, 历史）、失败分支是错误文案。
+            let result: Result<(Vec<String>, jj::CommitHistory), String> = cx
+                .background_executor()
+                .spawn(async move {
+                    jj::init_git_backend(&path)
+                        .map_err(|error| format!("创建仓库失败：{error}"))?;
+                    // 新仓库没有远程仓库，顺带读一遍；历史多半只有一个工作副本提交。
+                    let remotes = jj::load_remotes(&path).unwrap_or_default();
+                    let history = jj::load_history(&path, &revset)
+                        .map_err(|error| format!("读取提交历史失败：{error}"))?;
+
+                    Ok((remotes, history))
+                })
+                .await;
+
+            let _ = page.update_in(cx, |page, window, cx| {
+                page.operation = None;
+                // 建仓库期间有人改过 revset（触发了重读），那次读的还是没有仓库的项目，
+                // 现在仓库已经在了，按最新的 revset 再读一遍。
+                if page.history_request_id != request_id {
+                    page.reload_remotes(window, cx);
+                    page.reload_history(window, cx);
+                    return;
+                }
+
+                match result {
+                    Ok((remotes, history)) => {
+                        page.set_remotes(remotes, window, cx);
+                        page.commit_state.update(cx, |state, cx| {
+                            state.delegate_mut().set_history_result(Ok(history));
+                            cx.notify();
+                        });
+                        window.push_notification(
+                            (
+                                NotificationType::Success,
+                                // 启动器不碰工作副本快照，所以项目文件要等下一次 jj 操作才进历史。
+                                "已创建仓库（项目文件会在下一次 jj 操作时记录）".to_owned(),
+                            ),
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        window.push_notification((NotificationType::Error, error), cx);
+                        // 没建成的话还得让用户能再点一次，就按当前真实状态重读一遍：
+                        // 仓库要是其实建好了，这里会直接显示历史。
+                        page.reload_remotes(window, cx);
+                        page.reload_history(window, cx);
+                    }
+                }
             });
         })
         .detach();
@@ -887,13 +1111,9 @@ impl VcsPage {
                             cx,
                         );
                     }
+                    // 切换失败（比如工作副本有冲突）时历史本身还是好的，
+                    // 列表留着不动，只把失败原因说出来。
                     Err(error) => {
-                        page.commit_state.update(cx, |state, cx| {
-                            state
-                                .delegate_mut()
-                                .set_history_result(Err(anyhow::anyhow!(error.clone())));
-                            cx.notify();
-                        });
                         window.push_notification((NotificationType::Error, error), cx);
                     }
                 }
@@ -983,6 +1203,216 @@ impl VcsPage {
     /// 拉取当前远程：把远程上的 bookmark 拉下来，再重读一遍历史。
     fn fetch_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.run_remote_command(RemoteCommand::Fetch, window, cx);
+    }
+
+    /// 在右键的那一行上新建提交（`jj new <commit>`），工作副本会切到新提交。
+    fn start_new_commit(&mut self, commit_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let parent = format!("{:.8}", commit_id);
+        self.run_commit_op(
+            VcsOperation::NewCommit,
+            move |path| {
+                jj::start_new_commit(&path, &commit_id)
+                    .map_err(|error| format!("新建提交失败：{error}"))
+            },
+            move |new_commit_id| format!("已在 {parent} 上新建提交 {:.8}", new_commit_id),
+            window,
+            cx,
+        );
+    }
+
+    /// 「提交工作副本」的输入弹窗：描述预填当前工作副本提交的，改不改都行。
+    fn open_commit_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.operation.is_some() || window.has_active_dialog(cx) {
+            return;
+        }
+
+        let Some(path) = self.project_select.selected_path().cloned() else {
+            window.push_notification(
+                (NotificationType::Error, "当前没有选中的整合包".to_owned()),
+                cx,
+            );
+            return;
+        };
+        if !jj::is_repo(&path) {
+            window.push_notification(
+                (
+                    NotificationType::Error,
+                    "项目还不是仓库，先创建仓库".to_owned(),
+                ),
+                cx,
+            );
+            return;
+        }
+
+        // 回填当前工作副本提交的描述（没有描述就是空的），用户改不改都行。
+        // 描述从仓库里读全量，列表里那份只留了第一行。
+        let description = jj::working_copy_description(&path)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let original = description.clone();
+        let input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .default_value(description)
+                .placeholder("提交描述")
+        });
+        let muted = cx.theme().muted_foreground;
+
+        let page = cx.entity().downgrade();
+        let focus_input = input.clone();
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let page = page.clone();
+            let input = input.clone();
+            dialog
+                .title("提交工作副本")
+                .overlay_closable(true)
+                .footer(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("commit-cancel")
+                                .label("取消")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(Button::new("commit-confirm").label("提交").on_click({
+                            let input = input.clone();
+                            let original = original.clone();
+                            move |_, window, cx| {
+                                let message = input.read(cx).value().to_string();
+                                window.close_dialog(cx);
+                                let _ = page.update(cx, |page, cx| {
+                                    page.commit_working_copy(message, original.clone(), window, cx);
+                                });
+                            }
+                        })),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_2()
+                        .child(Label::new("给当前工作副本提交写一条描述。"))
+                        .child(Textarea::new(&input).h(px(88.)).w_full())
+                        .child(
+                            Label::new("文件改动要由 jj 命令行记录，启动器只管提交本身。")
+                                .text_sm()
+                                .text_color(muted),
+                        ),
+                )
+        });
+
+        // 弹窗这一帧过后再聚焦，光标直接落在描述里。
+        cx.defer_in(window, move |_page, window, cx| {
+            focus_input.update(cx, |state, cx| state.focus(window, cx));
+        });
+    }
+
+    /// 确认后把描述写到工作副本提交上。
+    fn commit_working_copy(
+        &mut self,
+        message: String,
+        original: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 描述没改就什么都不用做，也不用白跑一趟后台。
+        if message == original {
+            window.push_notification((NotificationType::Info, "描述没有变化".to_owned()), cx);
+            return;
+        }
+
+        let summary = if message.trim().is_empty() {
+            "已清空工作副本提交的描述".to_owned()
+        } else {
+            format!("已提交工作副本：{}", message.trim())
+        };
+        self.run_commit_op(
+            VcsOperation::CommitWorkingCopy,
+            move |path| {
+                jj::commit_working_copy(&path, &message)
+                    .map_err(|error| format!("提交工作副本失败：{error}"))
+            },
+            move |_| summary,
+            window,
+            cx,
+        );
+    }
+
+    /// 图上两个操作（新建提交、提交工作副本）共用的一条流程：
+    /// 锁住页面、后台跑 jj-lib、重读历史、成功后弹通知。
+    fn run_commit_op(
+        &mut self,
+        operation: VcsOperation,
+        action: impl FnOnce(std::path::PathBuf) -> Result<String, String> + Send + 'static,
+        message: impl FnOnce(&str) -> String + Send + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.operation.is_some() {
+            return;
+        }
+
+        let Some(path) = self.project_select.selected_path().cloned() else {
+            window.push_notification(
+                (NotificationType::Error, "当前没有选中的整合包".to_owned()),
+                cx,
+            );
+            return;
+        };
+
+        self.operation = Some(operation);
+        // 还在飞的那次「读历史」已经过期，别让它把新状态覆盖回去。
+        self.history_request_id = self.history_request_id.wrapping_add(1);
+        let request_id = self.history_request_id;
+        self.commit_state.update(cx, |state, cx| {
+            state.delegate_mut().set_disabled(true);
+            cx.notify();
+        });
+
+        let revset = self.revset.clone();
+        let page = cx.entity().downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let new_commit_id = action(path.clone())?;
+                    let history = jj::load_history(&path, &revset)
+                        .map_err(|error| format!("读取提交历史失败：{error}"))?;
+
+                    Ok::<_, String>((new_commit_id, history))
+                })
+                .await;
+
+            let _ = page.update_in(cx, |page, window, cx| {
+                page.operation = None;
+                page.commit_state.update(cx, |state, cx| {
+                    state.delegate_mut().set_disabled(false);
+                    cx.notify();
+                });
+                if page.history_request_id != request_id {
+                    return;
+                }
+
+                match result {
+                    Ok((new_commit_id, history)) => {
+                        page.commit_state.update(cx, |state, cx| {
+                            state.delegate_mut().set_history_result(Ok(history));
+                            cx.notify();
+                        });
+                        window.push_notification(
+                            (NotificationType::Success, message(&new_commit_id)),
+                            cx,
+                        );
+                    }
+                    // 失败时历史本身还是好的，列表留着不动，只把原因说出来。
+                    Err(error) => {
+                        window.push_notification((NotificationType::Error, error), cx);
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     /// 推送所有本地 bookmark 到当前远程。
@@ -1176,7 +1606,7 @@ impl Render for VcsPage {
                     )
                     .child(
                         Button::new("refresh-vcs")
-                            .icon(gpui_kit::component::IconName::RotateCw)
+                            .icon(IconName::RotateCw)
                             .label("刷新")
                             .disabled(self.operation.is_some())
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -1204,7 +1634,7 @@ impl Render for VcsPage {
                     )
                     .child(
                         Button::new("fetch-remote")
-                            .icon(gpui_kit::component::IconName::ArrowDown)
+                            .icon(IconName::ArrowDown)
                             .label("拉取")
                             .disabled(self.operation.is_some() || self.selected_remote.is_none())
                             .loading(
@@ -1216,7 +1646,7 @@ impl Render for VcsPage {
                     )
                     .child(
                         Button::new("push-remote")
-                            .icon(gpui_kit::component::IconName::ArrowUp)
+                            .icon(IconName::ArrowUp)
                             .label("推送")
                             .disabled(self.operation.is_some() || self.selected_remote.is_none())
                             .loading(
@@ -1382,5 +1812,18 @@ mod tests {
         );
         assert_eq!(remote_index(&remotes, Some(&"gone".to_owned())), None);
         assert_eq!(remote_index(&remotes, None), None);
+    }
+
+    #[test]
+    fn empty_state_messages_cover_every_case() {
+        // 「还不是仓库」走的是创建入口，不显示这句话；其余状态都得有话可说。
+        assert_eq!(EmptyState::Loading.message(), "正在读取提交历史…");
+        assert_eq!(EmptyState::NoProject.message(), "当前没有选中的整合包");
+        assert_eq!(EmptyState::CreatingRepo.message(), "正在创建仓库…");
+        assert_eq!(EmptyState::NoCommits.message(), "当前整合包没有历史提交");
+        assert_eq!(
+            EmptyState::Failure("读取提交历史失败：坏了".to_owned()).message(),
+            "读取提交历史失败：坏了"
+        );
     }
 }

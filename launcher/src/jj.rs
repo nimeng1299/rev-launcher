@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
 use jj_lib::backend::CommitId;
+use jj_lib::commit::Commit;
 use jj_lib::default_backend_factories::{
     default_backend_factories, default_working_copy_factories,
 };
@@ -17,14 +19,17 @@ use jj_lib::git::{
 use jj_lib::op_store::RefTarget;
 use jj_lib::ref_name::{RemoteName, RemoteNameBuf};
 use jj_lib::refs::{RefPushAction, classify_ref_push_action};
+use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo as _;
 use jj_lib::revset::{
-    RevsetAliasesMap, RevsetDiagnostics, RevsetExtensions, RevsetParseContext,
-    RevsetWorkspaceContext, SymbolResolver, parse, parse_string_expression,
+    ResolvedRevsetExpression, RevsetAliasesMap, RevsetDiagnostics, RevsetExtensions,
+    RevsetParseContext, RevsetWorkspaceContext, SymbolResolver, parse, parse_string_expression,
 };
+use jj_lib::rewrite::RebaseOptions;
 use jj_lib::settings::RemoteSettingsMap;
 use jj_lib::str_util::{StringExpression, StringMatcher};
 use jj_lib::time_util::DatePatternContext;
+use jj_lib::transaction::Transaction;
 use jj_lib::ui_path::RepoPathUiConverter;
 use jj_lib::workspace::Workspace;
 use pollster::FutureExt as _;
@@ -119,19 +124,17 @@ pub fn init_git_backend<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn load_history<P: AsRef<Path>>(path: P, revset_str: &str) -> anyhow::Result<CommitHistory> {
-    let path = path.as_ref();
-    let workspace = load_workspace(path)?;
-    let repo = workspace
-        .repo_loader()
-        .load_at_head()
-        .block_on()
-        .context("failed to load repository")?;
-    let working_copy_commit_id = repo
-        .view()
-        .get_wc_commit_id(workspace.workspace_name())
-        .map(ToString::to_string);
-
+/// 把 revset 字符串解析成能求值的表达式。
+///
+/// 除了读用户配置里的 revset 别名，还要补上启动器自己的兜底：用户没配
+/// `immutable_heads()` / `trunk()` 时，用 Git 那边习惯的 main/master 顶上，
+/// 不然默认 revset 和「哪些提交算不可变」都会落到 root() 上。
+fn resolve_revset(
+    repo: &Arc<ReadonlyRepo>,
+    workspace: &Workspace,
+    path: &Path,
+    revset_str: &str,
+) -> anyhow::Result<Arc<ResolvedRevsetExpression>> {
     let mut aliases = RevsetAliasesMap::new();
     let alias_names = repo
         .settings()
@@ -187,9 +190,70 @@ pub fn load_history<P: AsRef<Path>>(path: P, revset_str: &str) -> anyhow::Result
     let expression = parse(&mut RevsetDiagnostics::new(), revset_str, &context)
         .context("failed to parse revset")?;
     let symbol_resolver = SymbolResolver::new(repo.as_ref(), extensions.symbol_resolvers());
-    let revset = expression
+
+    expression
         .resolve_user_expression(repo.as_ref(), &symbol_resolver)
-        .context("failed to resolve revset")?
+        .context("failed to resolve revset")
+}
+
+/// 提交事务前，把「被重写过的提交」的后代 rebase 到新版本上。
+///
+/// jj-lib 在 `Transaction::write` 里会断言这件事已经做过，而好几种操作都会在不知不觉
+/// 中记下重写：`MutableRepo::edit()` 会放弃没人引用、且已经不是 head 的空工作副本提交，
+/// 导入远程 ref 时也可能放弃不可达提交。没有重写时它是空操作，所以每个会开事务的
+/// 操作都统一兜一次。
+fn rebase_rewritten_descendants(
+    transaction: &mut Transaction,
+    repo: &Arc<ReadonlyRepo>,
+    workspace: &Workspace,
+    path: &Path,
+) -> anyhow::Result<()> {
+    if !transaction.repo().has_rewrites() {
+        return Ok(());
+    }
+
+    // 不可变的提交（trunk、tag、别人推上来的 bookmark）不参与 rebase。
+    let immutable = resolve_revset(repo, workspace, path, "immutable_heads()")?;
+    transaction
+        .repo_mut()
+        .rebase_descendants_with_options(
+            &immutable,
+            &RebaseOptions::default(),
+            |_old_commit, _rebased_commit| {},
+        )
+        .block_on()
+        .context("failed to rebase descendants")?;
+    Ok(())
+}
+
+/// 事务落盘后，工作副本落在哪个提交上。
+///
+/// 被重写的提交会换成新的 id，所以不能拿操作前算出来的 id，得以视图为准。
+fn working_copy_commit(repo: &Arc<ReadonlyRepo>, workspace: &Workspace) -> anyhow::Result<Commit> {
+    let wc_id = repo
+        .view()
+        .get_wc_commit_id(workspace.workspace_name())
+        .cloned()
+        .context("working-copy commit not found")?;
+    repo.store()
+        .get_commit(&wc_id)
+        .context("working-copy commit does not exist")
+}
+
+pub fn load_history<P: AsRef<Path>>(path: P, revset_str: &str) -> anyhow::Result<CommitHistory> {
+    let path = path.as_ref();
+    let workspace = load_workspace(path)?;
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .block_on()
+        .context("failed to load repository")?;
+    let working_copy_commit_id = repo
+        .view()
+        .get_wc_commit_id(workspace.workspace_name())
+        .map(ToString::to_string);
+
+    let revset = resolve_revset(&repo, &workspace, path, revset_str)?
         .evaluate(repo.as_ref())
         .context("failed to evaluate repository history")?;
     let graph_nodes = futures::executor::block_on(async {
@@ -536,6 +600,8 @@ pub fn fetch_remote<P: AsRef<Path>>(path: P, remote: &str) -> anyhow::Result<Str
             .block_on()
             .map_err(|error| anyhow!("{error}{}", git_output.detail()))?
     };
+    // 导入远程 ref 时可能放弃了不可达提交，那也是一次重写，得先 rebase 后代。
+    rebase_rewritten_descendants(&mut transaction, &repo, &workspace, path)?;
     let repo = transaction
         .commit(format!("fetch from git remote {remote}"))
         .block_on()
@@ -641,15 +707,21 @@ pub fn push_remote<P: AsRef<Path>>(path: P, remote: &str) -> anyhow::Result<Stri
     }
 }
 
+/// 把界面上的提交 id（十六进制字符串）解析成 [`CommitId`]。
+fn parse_commit_id(commit_id: &str) -> anyhow::Result<CommitId> {
+    CommitId::try_from_hex(commit_id.as_bytes())
+        .ok_or_else(|| anyhow!("invalid commit id: {commit_id}"))
+}
+
 pub fn checkout<P: AsRef<Path>>(path: P, commit_id: &str) -> anyhow::Result<()> {
-    let mut workspace = load_workspace(path.as_ref())?;
+    let path = path.as_ref();
+    let mut workspace = load_workspace(path)?;
     let repo = workspace
         .repo_loader()
         .load_at_head()
         .block_on()
         .context("failed to load repository")?;
-    let commit_id = CommitId::try_from_hex(commit_id.as_bytes())
-        .ok_or_else(|| anyhow!("invalid commit id: {commit_id}"))?;
+    let commit_id = parse_commit_id(commit_id)?;
     let commit = repo
         .store()
         .get_commit(&commit_id)
@@ -661,17 +733,122 @@ pub fn checkout<P: AsRef<Path>>(path: P, commit_id: &str) -> anyhow::Result<()> 
         .edit(workspace.workspace_name().to_owned(), &commit)
         .block_on()
         .context("failed to select commit")?;
+    // 离开空的工作副本提交时它会被放弃，这算一次重写，提交事务前要 rebase 后代。
+    rebase_rewritten_descendants(&mut transaction, &repo, &workspace, path)?;
     let repo = transaction
         .commit(format!("checkout commit {commit_id}"))
         .block_on()
         .context("failed to save checkout")?;
-    let commit = repo.store().get_commit(&commit_id)?;
 
+    let commit = working_copy_commit(&repo, &workspace)?;
     workspace
         .check_out(repo.op_id().clone(), None, &commit)
         .block_on()
         .context("failed to update working copy")?;
     Ok(())
+}
+
+/// 以指定提交为父新建一个空提交，并把工作副本切过去（`jj new <commit>`）。
+///
+/// 新提交的树就是父提交的树，所以磁盘上的文件不会被动过；返回新提交的 id。
+pub fn start_new_commit<P: AsRef<Path>>(path: P, commit_id: &str) -> anyhow::Result<String> {
+    let path = path.as_ref();
+    let mut workspace = load_workspace(path)?;
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .block_on()
+        .context("failed to load repository")?;
+    let parent_id = parse_commit_id(commit_id)?;
+    let parent = repo
+        .store()
+        .get_commit(&parent_id)
+        .context("commit does not exist")?;
+
+    let mut transaction = repo.start_transaction();
+    let new_commit = transaction
+        .repo_mut()
+        .new_commit(vec![parent_id.clone()], parent.tree())
+        .write()
+        .block_on()
+        .context("failed to create the new commit")?;
+    transaction
+        .repo_mut()
+        .edit(workspace.workspace_name().to_owned(), &new_commit)
+        .block_on()
+        .context("failed to select the new commit")?;
+    // 原地新建时（右键的就是当前工作副本）没什么要 rebase 的；但如果原来那个空的
+    // 工作副本提交被放弃了，这里得把它的后代 rebase 好才能提交事务。
+    rebase_rewritten_descendants(&mut transaction, &repo, &workspace, path)?;
+    let repo = transaction
+        .commit(format!("new commit on {parent_id}"))
+        .block_on()
+        .context("failed to save the new commit")?;
+
+    let new_commit = working_copy_commit(&repo, &workspace)?;
+    workspace
+        .check_out(repo.op_id().clone(), None, &new_commit)
+        .block_on()
+        .context("failed to update working copy")?;
+    Ok(new_commit.id().to_string())
+}
+
+/// 提交工作副本：给当前工作副本提交写上描述，不改动它在图上的位置。
+///
+/// 描述是提交的一部分，所以写描述等于重写这个提交（后代跟着 rebase）。描述没变
+/// 就什么都不做，免得白白换一个 commit id。返回写完之后的工作副本提交 id。
+pub fn commit_working_copy<P: AsRef<Path>>(path: P, message: &str) -> anyhow::Result<String> {
+    let path = path.as_ref();
+    let mut workspace = load_workspace(path)?;
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .block_on()
+        .context("failed to load repository")?;
+    let wc_commit = working_copy_commit(&repo, &workspace)?;
+
+    if wc_commit.description() == message {
+        return Ok(wc_commit.id().to_string());
+    }
+
+    let mut transaction = repo.start_transaction();
+    transaction
+        .repo_mut()
+        .rewrite_commit(&wc_commit)
+        .set_description(message.to_owned())
+        .write()
+        .block_on()
+        .context("failed to describe the working-copy commit")?;
+    // 重写之后必须把后代 rebase 到新版本上（这一步也会把工作副本指针挪到新提交）。
+    rebase_rewritten_descendants(&mut transaction, &repo, &workspace, path)?;
+    let repo = transaction
+        .commit(format!("describe {}", wc_commit.id()))
+        .block_on()
+        .context("failed to save the description")?;
+
+    let wc_commit = working_copy_commit(&repo, &workspace)?;
+    workspace
+        .check_out(repo.op_id().clone(), None, &wc_commit)
+        .block_on()
+        .context("failed to update working copy")?;
+    Ok(wc_commit.id().to_string())
+}
+
+/// 当前工作副本提交的完整描述；没有描述（jj 显示成 "(no description)"）时是 `None`。
+///
+/// 弹提交框要用完整描述回填：历史列表里那份只留了第一行，拿它回填会把多行描述截断。
+pub fn working_copy_description<P: AsRef<Path>>(path: P) -> anyhow::Result<Option<String>> {
+    let workspace = load_workspace(path.as_ref())?;
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .block_on()
+        .context("failed to load repository")?;
+    let description = working_copy_commit(&repo, &workspace)?
+        .description()
+        .to_owned();
+
+    Ok((!description.trim().is_empty()).then_some(description))
 }
 
 pub fn move_local_bookmark<P: AsRef<Path>>(
