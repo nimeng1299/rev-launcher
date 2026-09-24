@@ -10,6 +10,7 @@ use gpui_kit::component::description_list::DescriptionList;
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListItem, ListState};
 use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::select::{Select, SelectEvent};
 use gpui_kit::component::sidebar::{Sidebar, SidebarGroup, SidebarMenu, SidebarMenuItem};
 use gpui_kit::component::{ActiveTheme, IconName, IndexPath};
@@ -18,7 +19,9 @@ use gpui_kit::{
     SharedString, Styled, Subscription, Task, WeakEntity, Window, div, px, rgb,
 };
 
-use mclib::detective::base::ResourceKind;
+use mclib::detective::base::{
+    ResourceKind, prune_files_without_record, prune_records_without_file,
+};
 use mclib::project::game_project::{GameProject, ModLoader};
 
 use resource_dialog::ResourceSyncDialog;
@@ -528,6 +531,55 @@ impl DevelopPage {
         ResourceSyncDialog::open(&project, kind, serialize, cx.entity().downgrade(), window, cx);
     }
 
+    /// 强制同步按钮：删掉多余的一边，让资源文件和 toml 记录一一对应。
+    ///
+    /// `by_records` 为 `true` 时以记录为准，删掉资源目录里没有 toml 的文件；
+    /// 为 `false` 时以文件为准，删掉 `.rev_launcher/<目录>` 里没有资源文件的记录。
+    fn force_sync(&mut self, by_records: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.project_select.selected_project().cloned() else {
+            return;
+        };
+        let Some(kind) = PackKind::from_section(self.section) else {
+            return;
+        };
+        let noun = kind.noun();
+
+        let result = if by_records {
+            prune_files_without_record(&project, kind.resource_kind())
+        } else {
+            prune_records_without_file(&project, kind.resource_kind())
+        };
+
+        match result {
+            Ok(deleted) if deleted.is_empty() => {
+                window.push_notification(
+                    (NotificationType::Info, "文件和记录已经一致，无需删除".to_owned()),
+                    cx,
+                );
+            }
+            Ok(deleted) => {
+                let target = if by_records { "文件" } else { "记录" };
+                window.push_notification(
+                    (
+                        NotificationType::Success,
+                        format!("已删除 {} 个多余{noun}{target}", deleted.len()),
+                    ),
+                    cx,
+                );
+            }
+            Err(error) => {
+                window.push_notification(
+                    (NotificationType::Error, format!("同步失败：{error}")),
+                    cx,
+                );
+            }
+        }
+
+        // 不管成败都重新扫一遍，让列表和磁盘保持一致。
+        self.reload_packs(window, cx);
+        cx.notify();
+    }
+
     /// 勾选框切换：把文件在正常后缀和追加 `.disabled` 之间重命名。
     fn set_pack_enabled(
         &mut self,
@@ -614,6 +666,24 @@ impl DevelopPage {
                     .label(format!("反序列化{noun}"))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_sync_dialog(false, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("prune-packs-records")
+                    .icon(IconName::Delete)
+                    .label("删除多余记录")
+                    .tooltip(format!("删掉没有对应{noun}文件的 toml 记录"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.force_sync(false, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("prune-packs-files")
+                    .icon(IconName::Delete)
+                    .label("删除多余文件")
+                    .tooltip(format!("删掉没有 toml 记录的{noun}文件"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.force_sync(true, window, cx);
                     })),
             );
 

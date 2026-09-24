@@ -268,6 +268,85 @@ pub fn deserialize_mods(project: &GameProject, threads: usize) -> Result<Downloa
     deserialize_resources(project, ResourceKind::Mod, threads)
 }
 
+// ---------------------------------------------------------------------------
+// 强制同步：让资源目录和 toml 记录互相对齐
+// ---------------------------------------------------------------------------
+
+/// 删除资源目录里没有对应 toml 记录的文件，返回被删除的文件名。
+///
+/// 对应关系只看文件名：资源文件 `x.jar` 对应记录
+/// `.rev_launcher/<目录>/x.jar.toml`。禁用的 `.disabled` 文件不参与序列化，
+/// 这里也不动它们。
+pub fn prune_files_without_record(
+    project: &GameProject,
+    kind: ResourceKind,
+) -> Result<Vec<String>, Error> {
+    let out_dir = detective_path(project).join(kind.dir_name());
+    let files = list_files(&project.path.join(kind.dir_name()), kind.ext())?;
+
+    let mut deleted = Vec::new();
+    for file in files {
+        let Some(filename) = file.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !out_dir.join(format!("{filename}.toml")).is_file() {
+            std::fs::remove_file(&file)?;
+            deleted.push(filename.to_owned());
+        }
+    }
+    Ok(deleted)
+}
+
+/// 删除 `.rev_launcher/<目录>` 下没有对应资源文件的 toml 记录，
+/// 返回被删除记录对应的资源文件名。
+///
+/// 记录 `x.jar.toml` 对应的资源是 `x.jar`；禁用的 `x.jar.disabled` 也算存在，
+/// 启用/禁用切换不会误删记录。
+pub fn prune_records_without_file(
+    project: &GameProject,
+    kind: ResourceKind,
+) -> Result<Vec<String>, Error> {
+    let out_dir = detective_path(project).join(kind.dir_name());
+    let resource_dir = project.path.join(kind.dir_name());
+
+    let entries = match std::fs::read_dir(&out_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut deleted = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !(path.is_file()
+            && path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("toml")))
+        {
+            continue;
+        }
+        // 文件名形如 `x.jar.toml`，去掉 `.toml` 就是资源文件名。
+        // 扩展名已经按忽略大小写校验过，直接截掉 5 个 ASCII 字符即可。
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if file_name.len() <= ".toml".len() {
+            continue;
+        }
+        let resource_name = &file_name[..file_name.len() - ".toml".len()];
+
+        let exists = resource_dir.join(resource_name).is_file()
+            || resource_dir
+                .join(format!("{resource_name}.disabled"))
+                .is_file();
+        if !exists {
+            std::fs::remove_file(&path)?;
+            deleted.push(resource_name.to_owned());
+        }
+    }
+    Ok(deleted)
+}
+
 /// 从目录读取所有 toml 文件并反序列化为 [`ModInfo`]，按 filename 排序。
 /// 目录不存在视为空。
 fn read_mod_infos(dir: &Path) -> Result<Vec<ModInfo>, Error> {
@@ -844,5 +923,78 @@ mod tests {
             ),
             "events: {events:?}"
         );
+    }
+
+    /// 按记录删文件：有 toml 的文件和 `.disabled` 文件保留，多余的删掉。
+    #[test]
+    fn prune_files_without_record_test() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = test_project(directory.path());
+        let mods = directory.path().join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+        std::fs::write(mods.join("a.jar"), b"a").unwrap();
+        std::fs::write(mods.join("b.jar"), b"b").unwrap();
+        // 禁用文件不参与序列化，也不应被清理。
+        std::fs::write(mods.join("c.jar.disabled"), b"c").unwrap();
+
+        let out_dir = directory.path().join(".rev_launcher/mods");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let info = ModInfo {
+            filename: "a.jar".into(),
+            sha1: String::new(),
+            curseforge: None,
+            modrinth: None,
+        };
+        std::fs::write(
+            out_dir.join("a.jar.toml"),
+            toml_edit::ser::to_string_pretty(&info).unwrap(),
+        )
+        .unwrap();
+
+        let deleted =
+            super::prune_files_without_record(&project, ResourceKind::Mod).unwrap();
+        assert_eq!(deleted, vec!["b.jar".to_owned()]);
+        assert!(mods.join("a.jar").is_file());
+        assert!(!mods.join("b.jar").exists());
+        assert!(mods.join("c.jar.disabled").is_file());
+    }
+
+    /// 按文件删记录：资源不存在（或只有 `.disabled` 时资源也算存在）的 toml 被删掉。
+    #[test]
+    fn prune_records_without_file_test() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = test_project(directory.path());
+        let mods = directory.path().join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+        std::fs::write(mods.join("a.jar"), b"a").unwrap();
+        std::fs::write(mods.join("c.jar.disabled"), b"c").unwrap();
+
+        let out_dir = directory.path().join(".rev_launcher/mods");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        for name in ["a.jar", "b.jar", "c.jar"] {
+            let info = ModInfo {
+                filename: name.into(),
+                sha1: String::new(),
+                curseforge: None,
+                modrinth: None,
+            };
+            std::fs::write(
+                out_dir.join(format!("{name}.toml")),
+                toml_edit::ser::to_string_pretty(&info).unwrap(),
+            )
+            .unwrap();
+        }
+        // 非 toml 文件不动。
+        std::fs::write(out_dir.join("readme.txt"), "x").unwrap();
+
+        let mut deleted =
+            super::prune_records_without_file(&project, ResourceKind::Mod).unwrap();
+        deleted.sort();
+        assert_eq!(deleted, vec!["b.jar".to_owned()]);
+        assert!(out_dir.join("a.jar.toml").is_file());
+        assert!(!out_dir.join("b.jar.toml").exists());
+        // `c.jar.disabled` 存在，`c.jar.toml` 记录保留。
+        assert!(out_dir.join("c.jar.toml").is_file());
+        assert!(out_dir.join("readme.txt").is_file());
     }
 }
