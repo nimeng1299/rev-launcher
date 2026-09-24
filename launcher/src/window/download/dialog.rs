@@ -2,9 +2,10 @@
 //! 点下载后切到和启动弹窗一样的步骤进度展示。
 //!
 //! 下载由 `InstallProgress::install_minecraft` 在新线程中执行：
-//! 拉清单并写入 `<name>.json`，下载客户端 jar，最后生成项目文件；
-//! 依赖库留到首次启动时再拉。
+//! 拉清单并写入 `<name>.json`，下载客户端 jar 和资源文件，
+//! 最后生成项目文件；依赖库留到首次启动时再拉。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,6 +14,7 @@ use gpui_kit::component::button::Button;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::marker::{Marker, MarkerContent, MarkerIcon, MarkerLoadingStyle};
+use gpui_kit::component::progress::Progress;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, IndexPath, Sizable, StyledExt, WindowExt,
@@ -20,10 +22,12 @@ use gpui_kit::component::{
 use gpui_kit::component::searchable_list::SearchableListItem;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, Styled, Subscription, Window, div, px,
+    AnyElement, App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
+    ParentElement, Render, SharedString, Styled, Subscription, Window, div, px, uniform_list,
 };
 use rfd::AsyncFileDialog;
+use sharingan::downloader::Downloader;
+use sharingan::status::DownloadStatus;
 
 use mclib::java::java_version::JavaVersion;
 use mclib::project::install::{install_forge, install_minecraft};
@@ -34,14 +38,20 @@ use mclib::project::versions::minecreft::Version;
 use crate::data::app_data::ProjectsRevision;
 use crate::data::settings::AppSettings;
 
-const INSTALL_STEPS: [&str; 3] = ["下载版本清单", "下载运行文件", "写入项目文件"];
+const INSTALL_STEPS: [&str; 4] = [
+    "下载版本清单",
+    "下载运行文件",
+    "下载资源文件",
+    "写入项目文件",
+];
 
 /// Forge 安装的步骤列表，比原版多安装器、支持库和处理器三个阶段。
-const FORGE_STEPS: [&str; 7] = [
+const FORGE_STEPS: [&str; 8] = [
     "下载安装器",
     "下载版本清单",
     "下载运行文件",
     "下载支持库",
+    "下载资源文件",
     "运行安装处理器",
     "写入版本 JSON",
     "写入项目文件",
@@ -215,8 +225,15 @@ fn step_index(state: InstallState, forge: bool) -> usize {
             }
         }
         InstallState::DownloadLibraries => 3,
-        InstallState::RunProcessors => 4,
-        InstallState::WriteVersionJson => 5,
+        InstallState::DownloadAssets => {
+            if forge {
+                4
+            } else {
+                2
+            }
+        }
+        InstallState::RunProcessors => 5,
+        InstallState::WriteVersionJson => 6,
         InstallState::Success | InstallState::Failed => 0,
     }
 }
@@ -249,6 +266,228 @@ fn step_marker(index: usize, label: &str, status: StepStatus, cx: &App) -> Marke
         .content(MarkerContent::new().text_color(color).text(label.to_owned()))
         .child(div().flex_1())
         .child(Label::new(text).text_sm())
+}
+
+#[derive(Debug)]
+struct FileProgress {
+    id: usize,
+    name: String,
+    failed: bool,
+    downloaded: u64,
+    total: Option<u64>,
+    speed: f64,
+}
+
+impl FileProgress {
+    fn percentage(&self) -> Option<f32> {
+        self.total
+            .filter(|total| *total > 0)
+            .map(|total| ((self.downloaded as f64 / total as f64) * 100.).clamp(0., 100.) as f32)
+    }
+}
+
+/// 下载器某一时刻的任务快照：正在下载的排在 `active`，
+/// 排队与失败的排在 `pending`。
+#[derive(Debug, Default)]
+struct DownloadSnapshot {
+    total: usize,
+    complete: usize,
+    active: Vec<FileProgress>,
+    pending: Vec<FileProgress>,
+}
+
+impl DownloadSnapshot {
+    /// `names` 用于把 hash 形式的文件名（objects 资源）翻译成可读路径。
+    fn read(downloader: &Downloader, names: Option<&HashMap<String, String>>) -> Self {
+        let mut snapshot = Self {
+            total: downloader.tasks().len(),
+            ..Self::default()
+        };
+        for task in downloader.tasks().values() {
+            let status = task.status();
+            if status.is_success() {
+                snapshot.complete += 1;
+                continue;
+            }
+            let name = names
+                .and_then(|names| names.get(task.filename().as_str()))
+                .cloned()
+                .unwrap_or_else(|| task.filename().clone());
+            let progress = task.progress();
+            let file = FileProgress {
+                id: task.id(),
+                name,
+                failed: status.is_failed(),
+                downloaded: progress.downloaded(),
+                total: progress.total(),
+                speed: progress.speed(),
+            };
+            match status {
+                DownloadStatus::Downloading => snapshot.active.push(file),
+                _ => snapshot.pending.push(file),
+            }
+        }
+        // task 表是 HashMap，排序后轮询不会打乱文件行；失败项优先显示。
+        snapshot.active.sort_by_key(|file| file.id);
+        snapshot.pending.sort_by_key(|file| (!file.failed, file.id));
+        snapshot
+    }
+}
+
+fn bytes(value: u64) -> String {
+    if value >= 1024 * 1024 * 1024 {
+        format!("{:.1} GiB", value as f64 / (1024. * 1024. * 1024.))
+    } else if value >= 1024 * 1024 {
+        format!("{:.1} MiB", value as f64 / (1024. * 1024.))
+    } else if value >= 1024 {
+        format!("{:.1} KiB", value as f64 / 1024.)
+    } else {
+        format!("{value} B")
+    }
+}
+
+/// 下载步骤下方的明细面板：汇总计数、正在下载的条目（带进度条和速度）
+/// 以及排队/失败文件列表。与启动弹窗的下载面板布局一致。
+fn download_panel(
+    index: usize,
+    downloader: Option<&Downloader>,
+    names: Option<&HashMap<String, String>>,
+    status: StepStatus,
+    cx: &App,
+) -> AnyElement {
+    let mut panel = div().v_flex().w_full().min_w_0().pl_6().gap_2();
+    let Some(downloader) = downloader else {
+        return panel
+            .child(
+                Label::new(if status == StepStatus::Active {
+                    "正在准备下载任务…"
+                } else {
+                    "尚未创建下载任务"
+                })
+                .text_sm()
+                .text_color(cx.theme().muted_foreground),
+            )
+            .into_any_element();
+    };
+    let snapshot = DownloadSnapshot::read(downloader, names);
+    if snapshot.total == 0 {
+        return panel
+            .child(Label::new("文件已齐全，无需下载").text_sm())
+            .into_any_element();
+    }
+    let failed = snapshot.pending.iter().filter(|file| file.failed).count();
+    panel = panel.child(
+        Label::new(format!(
+            "已完成 {}/{} · 下载中 {} · 等待 {} · 失败 {}",
+            snapshot.complete,
+            snapshot.total,
+            snapshot.active.len(),
+            snapshot.pending.len() - failed,
+            failed
+        ))
+        .text_sm()
+        .text_color(cx.theme().muted_foreground),
+    );
+    if !snapshot.active.is_empty() {
+        panel = panel.child(Label::new("正在下载").text_sm());
+    }
+    for file in snapshot.active {
+        let percentage = file.percentage();
+        let amount = match file.total {
+            Some(total) => format!("{} / {}", bytes(file.downloaded), bytes(total)),
+            None => format!("已下载 {} · 大小未知", bytes(file.downloaded)),
+        };
+        let speed = if file.speed.is_finite() && file.speed > 0. {
+            file.speed as u64
+        } else {
+            0
+        };
+        let id = SharedString::from(format!("download-{index}-file-{}", file.id));
+        panel = panel.child(
+            div()
+                .v_flex()
+                .min_w_0()
+                .w_full()
+                .gap_1()
+                .p_2()
+                .border_1()
+                .border_color(cx.theme().border)
+                .rounded(cx.theme().radius)
+                .child(
+                    div()
+                        .h_flex()
+                        .min_w_0()
+                        .gap_2()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .child(Label::new(file.name.clone()).text_sm()),
+                        )
+                        .child(
+                            Label::new(
+                                percentage
+                                    .map(|value| format!("{value:.1}%"))
+                                    .unwrap_or_else(|| "下载中".into()),
+                            )
+                            .text_sm(),
+                        ),
+                )
+                .child(
+                    Progress::new(id)
+                        .xsmall()
+                        .value(percentage.unwrap_or(0.))
+                        .loading(percentage.is_none())
+                        .accessibility_label(format!("{} 下载进度", file.name)),
+                )
+                .child(
+                    Label::new(format!("{amount} · {}/s", bytes(speed)))
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground),
+                ),
+        );
+    }
+    if !snapshot.pending.is_empty() {
+        let count = snapshot.pending.len();
+        panel = panel
+            .child(Label::new(format!("待下载与失败的文件（{count}）")).text_sm())
+            .child(
+                uniform_list(("install-pending", index), count, move |range, _, cx| {
+                    range
+                        .map(|row| {
+                            let file = &snapshot.pending[row];
+                            div()
+                                .h_flex()
+                                .h(px(28.))
+                                .w_full()
+                                .min_w_0()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Label::new(if file.failed { "失败" } else { "等待" })
+                                        .text_sm()
+                                        .text_color(if file.failed {
+                                            cx.theme().danger
+                                        } else {
+                                            cx.theme().muted_foreground
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .child(Label::new(file.name.clone()).text_sm()),
+                                )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .w_full()
+                .h(px((count.min(6) * 28) as f32)),
+            );
+    }
+    panel.into_any_element()
 }
 
 pub(super) struct DownloadDialog {
@@ -560,6 +799,45 @@ impl DownloadDialog {
             .is_some_and(|status| matches!(status, InstallStatus::Running(_)))
     }
 
+    /// 该步骤是否对应一个文件下载阶段（有明细面板可展示）。
+    fn is_download_step(&self, index: usize) -> bool {
+        if self.loader == LoaderKind::Forge {
+            // 下载运行文件 / 下载支持库 / 下载资源文件
+            matches!(index, 2..=4)
+        } else {
+            // 下载运行文件 / 下载资源文件
+            matches!(index, 1 | 2)
+        }
+    }
+
+    /// 步骤下标对应的下载器；该步骤不是下载阶段或下载器尚未创建时返回 `None`。
+    fn step_downloader(&self, index: usize) -> Option<Arc<Downloader>> {
+        let progress = self.progress.as_ref()?;
+        if self.loader == LoaderKind::Forge {
+            match index {
+                2 => progress.jar_downloader(),
+                3 => progress.libraries_downloader(),
+                4 => progress.assets_downloader(),
+                _ => None,
+            }
+        } else {
+            match index {
+                1 => progress.jar_downloader(),
+                2 => progress.assets_downloader(),
+                _ => None,
+            }
+        }
+    }
+
+    /// 该步骤是否是资源文件下载（文件名是 hash，需要用逻辑路径映射展示）。
+    fn is_assets_step(&self, index: usize) -> bool {
+        if self.loader == LoaderKind::Forge {
+            index == 4
+        } else {
+            index == 2
+        }
+    }
+
     /// 点「下载」：校验表单，然后交给 `InstallProgress::install_minecraft`
     /// 或 `install_forge` 在新线程中执行；这里只起一个轮询任务同步界面状态。
     fn start_install(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -634,13 +912,15 @@ impl DownloadDialog {
         };
         *self.status.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(InstallStatus::Running(0));
+        // 支持库和资源文件放进全局目录，和启动阶段读取的位置一致。
+        let settings = &cx.global::<AppSettings>().global_settings;
+        let libraries = settings.libraries_path.clone();
+        let assets = settings.assets_path.clone();
         let progress = match (forge_version, java) {
             (Some(version), Some(java)) => {
-                // 支持库放进全局支持库目录，和启动阶段读取的位置一致。
-                let libraries = cx.global::<AppSettings>().global_settings.libraries_path.clone();
-                install_forge(&name, &root, &libraries, java, &version)
+                install_forge(&name, &root, &libraries, &assets, java, &version)
             }
-            _ => install_minecraft(&name, &root, &self.version),
+            _ => install_minecraft(&name, &root, &assets, &self.version),
         };
         self.progress = Some(progress.clone());
 
@@ -739,7 +1019,7 @@ impl DownloadDialog {
                             } else if is_forge {
                                 "安装器会自动下载 Forge 支持库"
                             } else {
-                                "游戏文件将在首次启动时下载"
+                                "支持库将在首次启动时下载"
                             })
                             .text_sm(),
                         )
@@ -884,11 +1164,33 @@ impl Render for DownloadDialog {
                     );
                 }
             }
-            // 进度阶段：和启动弹窗一样的步骤列表。
+            // 进度阶段：和启动弹窗一样的步骤列表，下载步骤附带明细面板。
             Some(status) => {
+                let asset_names = self
+                    .progress
+                    .as_ref()
+                    .and_then(InstallProgress::asset_names);
                 for index in 0..self.steps.len() {
                     let step = step_status(index, status);
                     content = content.child(step_marker(index, self.steps[index], step, cx));
+                    let downloader = self.step_downloader(index);
+                    if self.is_download_step(index)
+                        && (downloader.is_some()
+                            || matches!(step, StepStatus::Active | StepStatus::Failed))
+                    {
+                        let names = if self.is_assets_step(index) {
+                            asset_names.as_deref()
+                        } else {
+                            None
+                        };
+                        content = content.child(download_panel(
+                            index,
+                            downloader.as_deref(),
+                            names,
+                            step,
+                            cx,
+                        ));
+                    }
                     if step == StepStatus::Failed
                         && let Some(error) = &error
                     {

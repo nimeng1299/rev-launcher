@@ -18,12 +18,15 @@ pub fn install_git_project(_path_buf: PathBuf) -> Result<GameProject, Error>{
 ///
 /// name: 名字
 /// path: 项目的父路径（项目将安装在`path.join(name)`）
+/// assets_path: 资源文件目录（应使用与启动时一致的 `settings.assets_path`，
+/// 即 `.minecraft/assets`），assetIndex 和 objects 都会下载到这里。
 pub fn install_minecraft<P: AsRef<Path>>(
     name: &String,
     path: P,
+    assets_path: P,
     version: &versions::minecreft::Version,
 ) -> InstallProgress{
-    InstallProgress::install_minecraft(name, path, version)
+    InstallProgress::install_minecraft(name, path, assets_path, version)
 }
 
 /// 安装 Forge。
@@ -31,17 +34,19 @@ pub fn install_minecraft<P: AsRef<Path>>(
 /// name: 名字；path: 项目的父路径（项目将安装在 `path.join(name)`）；
 /// libraries_path: 支持库目录（安装所需的库和处理器产物都放在这里，
 /// 应使用与启动时一致的 `settings.libraries_path`）；
+/// assets_path: 资源文件目录（应使用 `settings.assets_path`）；
 /// java: 用于运行安装处理器的 Java；version: 要安装的 Forge 版本。
 ///
 /// 在 `<name>/temp` 中下载并解压安装器，解析 `install_profile.json`，
-/// 下载缺失的依赖库后依次执行 processors，最后把合并后的
+/// 下载缺失的依赖库和资源文件后依次执行 processors，最后把合并后的
 /// `version.json` 写成 `<name>.json`。
 pub fn install_forge<P: AsRef<Path>>(
     name: &String,
     path: P,
     libraries_path: P,
+    assets_path: P,
     java: JavaVersion,
     version: &versions::forge::Version,
 ) -> InstallProgress{
-    InstallProgress::install_forge(name, path, libraries_path, java, version)
+    InstallProgress::install_forge(name, path, libraries_path, assets_path, java, version)
 }

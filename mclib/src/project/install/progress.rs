@@ -34,6 +34,11 @@ pub struct InstallProgress {
     jar_downloader: Arc<OnceLock<Arc<Downloader>>>,
     /// 安装器依赖的支持库下载器，进入 `DownloadLibraries` 阶段后可查询。
     libraries_downloader: Arc<OnceLock<Arc<Downloader>>>,
+    /// 资源文件（objects）的下载器，进入 `DownloadAssets` 阶段后可查询。
+    assets_downloader: Arc<OnceLock<Arc<Downloader>>>,
+    /// objects 文件名（hash）到索引中逻辑路径（如 `icons/icon_16x16.png`）
+    /// 的映射，进入 `DownloadAssets` 阶段后可查询，用于界面展示。
+    asset_names: Arc<OnceLock<Arc<HashMap<String, String>>>>,
 }
 
 impl InstallProgress {
@@ -44,6 +49,8 @@ impl InstallProgress {
             success: Arc::new(OnceLock::new()),
             jar_downloader: Arc::new(OnceLock::new()),
             libraries_downloader: Arc::new(OnceLock::new()),
+            assets_downloader: Arc::new(OnceLock::new()),
+            asset_names: Arc::new(OnceLock::new()),
         }
     }
 
@@ -51,13 +58,17 @@ impl InstallProgress {
     ///
     /// name: 名字
     /// path: 项目的父路径（项目将安装在`path.join(name)`）
+    /// assets_path: 资源文件目录（assetIndex 和 objects 都放在这里，
+    /// 应使用与启动时一致的 `settings.assets_path`）。
     pub fn install_minecraft<P: AsRef<Path>>(
         name: &String,
         path: P,
+        assets_path: P,
         version: &versions::minecreft::Version,
     ) -> Self {
         let progress = Self::new();
         let path = path.as_ref().to_path_buf().join(name);
+        let assets_path = assets_path.as_ref().to_path_buf();
         let name = name.clone();
         let url = version.url.clone();
         // 只清理本次安装新建的目录，避免误删已存在的同名文件夹。
@@ -65,7 +76,7 @@ impl InstallProgress {
 
         let handle = progress.clone();
         std::thread::spawn(move || {
-            if let Err(error) = handle.run_minecraft(&name, &path, &url) {
+            if let Err(error) = handle.run_minecraft(&name, &path, &assets_path, &url) {
                 if created {
                     let _ = std::fs::remove_dir_all(&path);
                 }
@@ -81,21 +92,24 @@ impl InstallProgress {
     /// name: 名字；path: 项目的父路径（项目将安装在 `path.join(name)`）；
     /// libraries_path: 支持库目录（安装所需的库和处理器产物都放在这里，
     /// 应使用与启动时一致的 `settings.libraries_path`）；
+    /// assets_path: 资源文件目录（应使用 `settings.assets_path`）；
     /// java: 用于运行安装处理器的 Java；version: 要安装的 Forge 版本。
     ///
     /// 在 `<name>/temp` 中下载并解压安装器，解析 `install_profile.json`，
-    /// 下载缺失的依赖库后依次执行 processors，最后把合并后的
+    /// 下载缺失的依赖库和资源文件后依次执行 processors，最后把合并后的
     /// `version.json` 写成 `<name>.json`。
     pub fn install_forge<P: AsRef<Path>>(
         name: &String,
         path: P,
         libraries_path: P,
+        assets_path: P,
         java: JavaVersion,
         version: &versions::forge::Version,
     ) -> Self {
         let progress = Self::new();
         let path = path.as_ref().to_path_buf().join(name);
         let libraries_path = libraries_path.as_ref().to_path_buf();
+        let assets_path = assets_path.as_ref().to_path_buf();
         let name = name.clone();
         let version = version.clone();
         // 只清理本次安装新建的目录，避免误删已存在的同名文件夹。
@@ -103,9 +117,14 @@ impl InstallProgress {
 
         let handle = progress.clone();
         std::thread::spawn(move || {
-            if let Err(error) =
-                handle.run_forge(&name, &path, &libraries_path, &java, &version)
-            {
+            if let Err(error) = handle.run_forge(
+                &name,
+                &path,
+                &libraries_path,
+                &assets_path,
+                &java,
+                &version,
+            ) {
                 if created {
                     let _ = std::fs::remove_dir_all(&path);
                 }
@@ -145,6 +164,20 @@ impl InstallProgress {
         self.libraries_downloader.get().cloned()
     }
 
+    /// 获取资源文件下载器的共享句柄；尚未创建时返回 `None`，不会等待初始化。
+    ///
+    /// 下载器创建后会一直保留，可通过它查询任务和进度。
+    pub fn assets_downloader(&self) -> Option<Arc<Downloader>> {
+        self.assets_downloader.get().cloned()
+    }
+
+    /// 获取 objects 文件名（hash）到逻辑路径的映射；尚未建立时返回 `None`。
+    ///
+    /// objects 任务以 hash 作为文件名，界面可用该映射显示可读的资源路径。
+    pub fn asset_names(&self) -> Option<Arc<HashMap<String, String>>> {
+        self.asset_names.get().cloned()
+    }
+
     /// 记录错误并把状态切换为 `Failed`。
     fn set_error(&self, error: crate::error::Error) {
         *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(error));
@@ -155,6 +188,7 @@ impl InstallProgress {
         &self,
         name: &str,
         path: &Path,
+        assets_path: &Path,
         url: &str,
     ) -> Result<(), crate::error::Error> {
         std::fs::create_dir_all(path)?;
@@ -171,7 +205,17 @@ impl InstallProgress {
         self.state.store(InstallState::InstallJar, Ordering::SeqCst);
         download_jar(&self.jar_downloader, name, path, &json)?;
 
-        // 3. 从 <name>.json 读取版本信息，生成并写入项目文件。
+        // 3. 下载资源索引（assetIndex）和它列出的 objects 到 assets_path。
+        self.state
+            .store(InstallState::DownloadAssets, Ordering::SeqCst);
+        download_assets(
+            &self.assets_downloader,
+            &self.asset_names,
+            assets_path,
+            &json,
+        )?;
+
+        // 4. 从 <name>.json 读取版本信息，生成并写入项目文件。
         let project = crate::project::game_project::get_game_project(&path.to_path_buf())?;
         let _ = self.success.set(project);
         self.state.store(InstallState::Success, Ordering::SeqCst);
@@ -186,6 +230,7 @@ impl InstallProgress {
         name: &str,
         path: &Path,
         libraries_path: &Path,
+        assets_path: &Path,
         java: &JavaVersion,
         version: &versions::forge::Version,
     ) -> Result<(), crate::error::Error> {
@@ -246,7 +291,17 @@ impl InstallProgress {
             artifacts,
         )?;
 
-        // 4. 构建变量表并按顺序执行 processors。
+        // 4. 下载资源索引（assetIndex）和它列出的 objects 到 assets_path。
+        self.state
+            .store(InstallState::DownloadAssets, Ordering::SeqCst);
+        download_assets(
+            &self.assets_downloader,
+            &self.asset_names,
+            assets_path,
+            &vanilla_json,
+        )?;
+
+        // 5. 构建变量表并按顺序执行 processors。
         self.state.store(InstallState::RunProcessors, Ordering::SeqCst);
         let mut variables = collect_data(
             &profile,
@@ -257,7 +312,7 @@ impl InstallProgress {
         )?;
         run_processors(&profile, java, &libraries_dir, &mut variables)?;
 
-        // 5. 合并版本 JSON：原版清单提供资源/规则等字段，version.json 提供
+        // 6. 合并版本 JSON：原版清单提供资源/规则等字段，version.json 提供
         //    mainClass、arguments 和支持库；写成 <name>.json 并附加 patches。
         self.state
             .store(InstallState::WriteVersionJson, Ordering::SeqCst);
@@ -268,7 +323,7 @@ impl InstallProgress {
             serde_json::to_string_pretty(&manifest)?,
         )?;
 
-        // 6. 清理临时文件并生成项目信息。
+        // 7. 清理临时文件并生成项目信息。
         let _ = std::fs::remove_dir_all(&temp_dir);
         let project = crate::project::game_project::get_game_project(&root)?;
         let _ = self.success.set(project);
@@ -387,6 +442,217 @@ fn download_jar(
     } else {
         Err(failed(format!("下载失败：{}", failures.join(", "))))
     }
+}
+
+/// objects 资源文件的下载地址前缀；完整地址是
+/// `<RESOURCES_URL>/<hash 的前两位字符>/<hash>`。
+const RESOURCES_URL: &str = "https://resources.download.minecraft.net";
+
+/// 备用资源镜像（BMCLAPI），路径布局与官方一致；官方地址失败时使用。
+const RESOURCES_MIRROR_URL: &str = "https://bmclapi2.bangbang93.com/assets";
+
+/// 已存在的文件是否满足完整性要求（存在、非空、大小一致、sha1 匹配）。
+/// `size` 或 `sha1` 为 `None` 时跳过对应检查。
+fn file_matches(path: &Path, size: Option<u64>, sha1: Option<&str>) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() == 0 {
+        return false;
+    }
+    if size.is_some_and(|size| size != metadata.len()) {
+        return false;
+    }
+    sha1.is_none_or(|expected| {
+        file_sha1(path).is_ok_and(|hash| hash.eq_ignore_ascii_case(expected))
+    })
+}
+
+/// 下载版本清单 `assetIndex` 指向的资源索引和全部 objects 文件。
+///
+/// 索引写入 `<assets_dir>/indexes/<id>.json`；objects 的下载见
+/// [`download_objects`]。清单缺少 assetIndex 时跳过。
+fn download_assets(
+    slot: &OnceLock<Arc<Downloader>>,
+    names_slot: &OnceLock<Arc<HashMap<String, String>>>,
+    assets_dir: &Path,
+    json: &Value,
+) -> Result<(), crate::error::Error> {
+    let Some(index_info) = json.get("assetIndex") else {
+        return Ok(());
+    };
+    let id = index_info
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| json.get("assets").and_then(Value::as_str))
+        .ok_or_else(|| failed("版本 JSON 缺少 assetIndex.id"))?;
+    let url = index_info
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| failed("版本 JSON 缺少 assetIndex.url"))?;
+    let index_path = assets_dir
+        .join("indexes")
+        .join(relative_path(&format!("{id}.json"))?);
+
+    // 索引文件不定期更新：已存在且校验通过时复用，否则重新下载并复核。
+    let size = index_info.get("size").and_then(Value::as_u64);
+    let sha1 = index_info
+        .get("sha1")
+        .and_then(Value::as_str)
+        .map(str::to_lowercase);
+    if !file_matches(&index_path, size, sha1.as_deref()) {
+        download_file(url, &index_path)?;
+        if !file_matches(&index_path, size, sha1.as_deref()) {
+            return Err(failed(format!(
+                "资源索引 {} 校验失败",
+                index_path.display()
+            )));
+        }
+    }
+    let index: Value = serde_json::from_str(&std::fs::read_to_string(&index_path)?)?;
+    let Some(objects) = index.get("objects").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    download_objects(
+        slot,
+        names_slot,
+        RESOURCES_URL,
+        assets_dir,
+        id,
+        objects,
+        index.get("virtual").and_then(Value::as_bool) == Some(true),
+    )
+}
+
+/// 下载索引 `objects` 段列出的全部资源文件。
+///
+/// 每个 object 写入 `<assets_dir>/objects/<hash 的前两位字符>/<hash>`，
+/// 地址为 `<resources_url>/<hash 的前两位字符>/<hash>`；已存在且
+/// size/sha1 校验通过的文件跳过，同一 hash 只下载一次，失败任务会按
+/// 同一地址自动重试一次，仍失败则改走 BMCLAPI 镜像。
+/// `virtual` 为真时（老版本索引的 `"virtual": true`）把每个文件按原名
+/// 再拷贝一份到 `<assets_dir>/virtual/<索引 id>/`（通常为 `virtual/legacy/`）。
+///
+/// `names_slot` 存入 hash 到逻辑路径的映射，供界面把 hash 文件名翻译成
+/// 可读的资源名。
+fn download_objects(
+    slot: &OnceLock<Arc<Downloader>>,
+    names_slot: &OnceLock<Arc<HashMap<String, String>>>,
+    resources_url: &str,
+    assets_dir: &Path,
+    index_id: &str,
+    objects: &Map<String, Value>,
+    virtual_index: bool,
+) -> Result<(), crate::error::Error> {
+    // 收集需要下载的 objects：文件名即 hash，同一 hash 只下载一次。
+    let mut pending = Vec::new();
+    let mut names = Vec::new();
+    let mut seen = HashSet::new();
+    for (name, object) in objects {
+        let path = relative_path(name)?;
+        let hash = object
+            .get("hash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| failed(format!("资源 {name} 缺少 hash")))?
+            .to_lowercase();
+        if hash.len() < 2 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(failed(format!("资源 {name} 的 hash 无效：{hash}")));
+        }
+        let size = object.get("size").and_then(Value::as_u64);
+        names.push((path, hash.clone(), size));
+        let target = assets_dir.join("objects").join(&hash[..2]).join(&hash);
+        if seen.insert(hash.clone())
+            && !file_matches(&target, size, Some(hash.as_str()))
+        {
+            pending.push((target, hash));
+        }
+    }
+    // hash -> 逻辑路径，供界面展示和失败信息使用。
+    let display: Arc<HashMap<String, String>> = Arc::new(
+        names
+            .iter()
+            .map(|(path, hash, _)| {
+                (
+                    hash.clone(),
+                    path.to_string_lossy().replace('\\', "/"),
+                )
+            })
+            .collect(),
+    );
+    let _ = names_slot.set(display.clone());
+
+    let mut downloader = DownloadBuilder::new().thread_num(16).build();
+    for (target, hash) in pending {
+        let filename = hash.clone();
+        let parent = target
+            .parent()
+            .ok_or_else(|| failed("资源文件路径缺少父目录"))?
+            .to_path_buf();
+        let url = format!("{resources_url}/{}/{hash}", &hash[..2]);
+        // 官方地址不可用时改走镜像（镜像路径布局相同）。
+        let mirror = format!("{RESOURCES_MIRROR_URL}/{}/{hash}", &hash[..2]);
+        downloader.download(move |builder| {
+            let retry = url.clone();
+            builder
+                .url(url)
+                .path(parent)
+                .filename(filename)
+                .overwrite(true)
+                .timeout(Some(Duration::from_secs(120)))
+                // 资源文件量大且多为小文件：先按原地址重试一次，再切镜像。
+                .add_fallback(move |mut options| {
+                    options.url = retry.clone();
+                    Ok(options)
+                })
+                .add_fallback(move |mut options| {
+                    options.url = mirror.clone();
+                    Ok(options)
+                })
+                // hash 就是 sha1，校验哈希即覆盖完整性（含大小）。
+                .validator(move |file| {
+                    if file_matches(&file, None, Some(&hash)) {
+                        Ok(())
+                    } else {
+                        Err(DownloadFailure::ValidationError)
+                    }
+                })
+                .build()
+        });
+    }
+    let downloader = slot.get_or_init(|| Arc::new(downloader));
+    wait_finished(downloader);
+    let failures: Vec<String> = downloader
+        .tasks()
+        .values()
+        .filter(|task| !task.status().is_success())
+        .map(|task| {
+            let reason = task.failed_reason();
+            let name = display
+                .get(task.filename().as_str())
+                .map(String::as_str)
+                .unwrap_or_else(|| task.filename().as_str());
+            format!("{name}（{reason:?}）")
+        })
+        .collect();
+    if !failures.is_empty() {
+        return Err(failed(format!(
+            "资源文件下载失败：{}",
+            failures.join(", ")
+        )));
+    }
+
+    if virtual_index {
+        let virtual_dir = assets_dir.join("virtual").join(relative_path(index_id)?);
+        for (name, hash, _) in &names {
+            let source = assets_dir.join("objects").join(&hash[..2]).join(hash);
+            let target = virtual_dir.join(name);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&source, &target)?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -1106,8 +1372,202 @@ pub enum InstallState {
     DownloadVersionJson,
     DownloadLibraries,
     InstallJar,
+    /// 下载资源索引（assetIndex）和 objects 资源文件。
+    DownloadAssets,
     RunProcessors,
     WriteVersionJson,
     Success,
     Failed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap as StdHashMap;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::time::Instant;
+
+    /// 起一个简单的静态文件服务器：`files` 的键是请求路径，值是响应体。
+    /// 返回 (url 前缀, 请求数, 服务线程)。
+    fn serve_files(
+        files: StdHashMap<String, Vec<u8>>,
+    ) -> (String, Arc<AtomicUsize>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let served = Arc::new(AtomicUsize::new(0));
+        let served_in_thread = served.clone();
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if Instant::now() > deadline {
+                    return;
+                }
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                served_in_thread.fetch_add(1, AtomicOrdering::SeqCst);
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut request = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    request.push_str(&line);
+                }
+                let path = request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .split('?')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                match files.get(&path) {
+                    Some(body) => {
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes());
+                        let _ = stream.write_all(body);
+                    }
+                    None => {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                }
+            }
+        });
+        (base, served, handle)
+    }
+
+    fn sha1_hex(content: &[u8]) -> String {
+        let mut hasher = sha1::Sha1::new();
+        hasher.update(content);
+        hex::encode(hasher.finalize())
+    }
+
+    /// objects 下载：文件按 hash 写入 objects/<前两位>/<hash>，
+    /// virtual 索引再按原名复制一份到 virtual/<id>/。
+    #[test]
+    fn objects_are_downloaded_and_copied_to_virtual_dir() {
+        let assets = tempfile::tempdir().unwrap();
+        let bodies = [
+            ("icons/icon_16x16.png", b"icon16".as_slice()),
+            ("icons/icon_32x32.png", b"icon32".as_slice()),
+            ("lang/en_US.lang", b"language".as_slice()),
+        ];
+        let mut files = StdHashMap::new();
+        let mut entries = serde_json::Map::new();
+        for (name, body) in bodies {
+            let hash = sha1_hex(body);
+            files.insert(format!("/{}/{hash}", &hash[..2]), body.to_vec());
+            entries.insert(
+                name.to_string(),
+                json!({"hash": hash, "size": body.len()}),
+            );
+        }
+        let (base, _served, _server) = serve_files(files);
+
+        let slot = OnceLock::new();
+        let names_slot = OnceLock::new();
+        download_objects(
+            &slot,
+            &names_slot,
+            &base,
+            assets.path(),
+            "legacy",
+            &entries,
+            true,
+        )
+        .unwrap();
+
+        for (name, body) in bodies {
+            let hash = sha1_hex(body);
+            let object = assets.path().join(format!("objects/{}/{hash}", &hash[..2]));
+            assert_eq!(std::fs::read(&object).unwrap(), body);
+            let virtual_copy = assets.path().join("virtual/legacy").join(name);
+            assert_eq!(std::fs::read(&virtual_copy).unwrap(), body);
+        }
+        // 已存在的文件不会重复下载。
+        download_objects(
+            &slot,
+            &names_slot,
+            "http://127.0.0.1:9/unreachable",
+            assets.path(),
+            "legacy",
+            &entries,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            names_slot.get().unwrap()[&sha1_hex(b"language")],
+            "lang/en_US.lang"
+        );
+    }
+
+    /// 同名 hash 只下载一次；下载失败的资源用逻辑路径报错。
+    #[test]
+    fn objects_deduplicate_and_failures_report_logical_names() {
+        let assets = tempfile::tempdir().unwrap();
+        let body = b"shared";
+        let hash = sha1_hex(body);
+        let mut files = StdHashMap::new();
+        files.insert(format!("/{}/{hash}", &hash[..2]), body.to_vec());
+        let (base, served, _server) = serve_files(files);
+
+        let mut entries = serde_json::Map::new();
+        entries.insert(
+            "a/first.bin".to_string(),
+            json!({"hash": hash, "size": body.len()}),
+        );
+        entries.insert(
+            "b/second.bin".to_string(),
+            json!({"hash": hash, "size": body.len()}),
+        );
+        entries.insert(
+            "c/missing.bin".to_string(),
+            json!({"hash": "0123456789abcdef0123456789abcdef01234567", "size": 4}),
+        );
+
+        let slot = OnceLock::new();
+        let names_slot = OnceLock::new();
+        let error = download_objects(
+            &slot,
+            &names_slot,
+            &base,
+            assets.path(),
+            "test",
+            &entries,
+            false,
+        )
+        .unwrap_err();
+        // 两个相同 hash 合并为一次请求；缺失的资源原地址重试一次后转镜像。
+        assert_eq!(served.load(AtomicOrdering::SeqCst), 3);
+        let message = error.to_string();
+        assert!(message.contains("c/missing.bin"), "错误信息：{message}");
+        // ureq 默认把非 2xx 状态码归为 NetworkError，断言只认状态码数字。
+        assert!(message.contains("404"), "错误信息：{message}");
+        assert!(
+            assets
+                .path()
+                .join(format!("objects/{}/{hash}", &hash[..2]))
+                .is_file()
+        );
+    }
 }
