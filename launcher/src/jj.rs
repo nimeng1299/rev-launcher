@@ -17,7 +17,7 @@ use jj_lib::git::{
     expand_fetch_refspecs, load_default_fetch_bookmarks, push_refs,
 };
 use jj_lib::op_store::RefTarget;
-use jj_lib::ref_name::{RemoteName, RemoteNameBuf};
+use jj_lib::ref_name::{RefName, RemoteName, RemoteNameBuf};
 use jj_lib::refs::{RefPushAction, classify_ref_push_action};
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo as _;
@@ -935,6 +935,74 @@ pub fn add_remote<P: AsRef<Path>>(path: P, name: &str, url: &str) -> anyhow::Res
     Ok(())
 }
 
+/// bookmark 名字能不能用。
+///
+/// jj 自己有一套名字语法（`jj bookmark create` 遇到不合法的名字会报 "Failed to parse
+/// bookmark name"），这里照同样的方向查一遍。比 jj 严一点没关系，放过去一个非法名字
+/// 才是麻烦：本地视图收下了，等到导出/推送时才在 git 那边失败。
+fn validate_bookmark_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("bookmark 名字不能为空");
+    }
+    if name == "@" {
+        anyhow::bail!("bookmark 不能叫 @（@ 是工作副本提交的别名）");
+    }
+    if name.starts_with('-') {
+        anyhow::bail!("bookmark 名字不能以 - 开头");
+    }
+    if name.starts_with('/') || name.ends_with('/') || name.ends_with('.') {
+        anyhow::bail!("bookmark 名字不能以 / 或 . 开头结尾");
+    }
+    if name.ends_with(".lock") {
+        anyhow::bail!("bookmark 名字不能以 .lock 结尾");
+    }
+    if name.contains("..") || name.contains("//") || name.contains("@{") {
+        anyhow::bail!("bookmark 名字里不能有 ..、// 或 @{{");
+    }
+    if let Some(bad) = name.chars().find(|c| {
+        c.is_whitespace() || c.is_control() || matches!(c, '~' | '^' | ':' | '?' | '[' | '\\' | '*')
+    }) {
+        anyhow::bail!("bookmark 名字里不能有 {bad:?}");
+    }
+
+    Ok(())
+}
+
+/// 在指定提交上创建 bookmark（`jj bookmark create <name> -r <commit>`）。
+///
+/// 同名 bookmark 已经存在就报错：想挪动已有的 bookmark，列表里把它拖到目标提交更直接。
+pub fn create_bookmark<P: AsRef<Path>>(path: P, name: &str, commit_id: &str) -> anyhow::Result<()> {
+    let name = name.trim();
+    validate_bookmark_name(name)?;
+
+    let workspace = load_workspace(path.as_ref())?;
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .block_on()
+        .context("failed to load repository")?;
+    let commit_id = parse_commit_id(commit_id)?;
+    let commit = repo
+        .store()
+        .get_commit(&commit_id)
+        .context("commit does not exist")?;
+
+    let ref_name = RefName::new(name);
+    if repo.view().get_local_bookmark(ref_name).is_present() {
+        anyhow::bail!("bookmark {name} 已经存在");
+    }
+
+    let mut transaction = repo.start_transaction();
+    transaction
+        .repo_mut()
+        .set_local_bookmark_target(ref_name, RefTarget::normal(commit.id().clone()));
+    transaction
+        .commit(format!("create bookmark {name}"))
+        .block_on()
+        .context("failed to save the bookmark")?;
+    Ok(())
+}
+
 pub fn move_local_bookmark<P: AsRef<Path>>(
     path: P,
     bookmark_name: &str,
@@ -955,7 +1023,7 @@ pub fn move_local_bookmark<P: AsRef<Path>>(
 
     let mut transaction = repo.start_transaction();
     transaction.repo_mut().set_local_bookmark_target(
-        jj_lib::ref_name::RefName::new(bookmark_name),
+        RefName::new(bookmark_name),
         RefTarget::normal(commit.id().clone()),
     );
     transaction
@@ -994,6 +1062,20 @@ mod tests {
 
         // 本仓库就是从 GitHub 上的 origin 克隆出来的，列表里应该有它。
         assert!(remotes.iter().any(|remote| remote == "origin"));
+    }
+
+    #[test]
+    fn validate_bookmark_name_accepts_normal_names_and_rejects_broken_ones() {
+        for name in ["ok-name", "feat/new-thing", "UPPER_ok", "中文名", "v1.0"] {
+            assert!(validate_bookmark_name(name).is_ok(), "{name} 应该能用");
+        }
+
+        for name in [
+            "", " ", "a b", "a..b", "a:b", "a^b", "a~b", "a?b", "a[b", "a\\b", "@{x}", "@",
+            "-lead", "/lead", "trail/", "trail.", "end.lock", "a//b",
+        ] {
+            assert!(validate_bookmark_name(name).is_err(), "{name} 不该被接受");
+        }
     }
 
     #[test]

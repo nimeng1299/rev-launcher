@@ -645,6 +645,22 @@ impl ListDelegate for CommitListDelegate {
                                         });
                                     }),
                             )
+                            .item(
+                                PopupMenuItem::new("创建 bookmark")
+                                    .icon(IconName::Star)
+                                    .on_click({
+                                        let page = context_page.clone();
+                                        let commit_id = context_commit_id.clone();
+                                        move |_, window, cx| {
+                                            let commit_id = commit_id.clone();
+                                            let _ = page.update(cx, |page, cx| {
+                                                page.open_create_bookmark_dialog(
+                                                    commit_id, window, cx,
+                                                );
+                                            });
+                                        }
+                                    }),
+                            )
                         })
                         .w_full()
                         .h(px(GRAPH_ROW_HEIGHT))
@@ -773,6 +789,7 @@ enum VcsOperation {
     CommitWorkingCopy,
     Merge,
     AddRemote,
+    CreateBookmark,
 }
 
 /// 操作失败时怎么把原因说出来。
@@ -1456,6 +1473,116 @@ impl VcsPage {
             },
             move |_| summary,
             ErrorReporting::Notification,
+            window,
+            cx,
+        );
+    }
+
+    /// 创建 bookmark 的弹窗：填名字，指向右键的那一项。
+    fn open_create_bookmark_dialog(
+        &mut self,
+        commit_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.operation.is_some() || window.has_active_dialog(cx) {
+            return;
+        }
+
+        let short_commit_id = format!("{:.8}", commit_id);
+        let input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("bookmark 名字，例如 feature/x"));
+        let muted = cx.theme().muted_foreground;
+
+        let page = cx.entity().downgrade();
+        let focus_input = input.clone();
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let page = page.clone();
+            let input = input.clone();
+            let commit_id = commit_id.clone();
+            let short_commit_id = short_commit_id.clone();
+            dialog
+                .title("创建 bookmark")
+                .overlay_closable(true)
+                .footer(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("create-bookmark-cancel")
+                                .label("取消")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("create-bookmark-confirm").label("创建").on_click({
+                                let page = page.clone();
+                                let input = input.clone();
+                                move |_, window, cx| {
+                                    let name = input.read(cx).value().trim().to_owned();
+                                    if name.is_empty() {
+                                        // 弹窗留着，用户可以接着填。
+                                        window.push_notification(
+                                            (
+                                                NotificationType::Error,
+                                                "bookmark 名字不能为空".to_owned(),
+                                            ),
+                                            cx,
+                                        );
+                                        return;
+                                    }
+
+                                    window.close_dialog(cx);
+                                    let commit_id = commit_id.clone();
+                                    let _ = page.update(cx, |page, cx| {
+                                        page.create_bookmark(commit_id, name, window, cx);
+                                    });
+                                }
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_2()
+                        .child(Label::new(format!(
+                            "在新提交 {short_commit_id} 上建一个 bookmark。"
+                        )))
+                        .child(Input::new(&input).w_full())
+                        .child(
+                            Label::new("同名 bookmark 已经存在的话会报错；要挪动它，直接把列表里的它拖过去。")
+                                .text_sm()
+                                .text_color(muted),
+                        ),
+                )
+        });
+
+        // 弹窗这一帧过后再聚焦，光标直接落在名字框里。
+        cx.defer_in(window, move |_page, window, cx| {
+            focus_input.update(cx, |state, cx| state.focus(window, cx));
+        });
+    }
+
+    /// 真正去创建 bookmark，建完重读历史让标签显示出来。
+    fn create_bookmark(
+        &mut self,
+        commit_id: String,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let notification_name = name.clone();
+        let bookmark_commit_id = commit_id.clone();
+        self.run_commit_op(
+            VcsOperation::CreateBookmark,
+            move |path| {
+                jj::create_bookmark(&path, &name, &commit_id)
+                    // 这个操作的返回值只是给通知文案用的，这里用不上，回填提交 id。
+                    .map(|()| bookmark_commit_id.clone())
+                    .map_err(|error| format!("创建 bookmark 失败：{error}"))
+            },
+            move |_| format!("已创建 bookmark {notification_name}"),
+            ErrorReporting::Dialog("创建 bookmark 失败"),
             window,
             cx,
         );
