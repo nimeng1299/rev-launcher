@@ -18,6 +18,10 @@ pub struct GlobalSettings {
         _code = "std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(\".\")).join(\".minecraft\").join(\"libraries\")"
     )]
     pub libraries_path: PathBuf,
+    #[default(
+        _code = "std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(\".\")).join(\".minecraft\").join(\"assets\")"
+    )]
+    pub assets_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
