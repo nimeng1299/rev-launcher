@@ -10,6 +10,7 @@ use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, IndexPath, StyledExt, WindowExt, h_flex,
 };
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     AnyElement, App, AppContext, ClickEvent, Context, Entity, Hsla, InteractiveElement,
     IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
@@ -314,6 +315,8 @@ fn bookmark_element(bookmark: &jj::Bookmark, disabled: bool) -> AnyElement {
             false,
         ),
     };
+    // 没被跟踪的远程 bookmark 推不动，画成虚线加淡一点，和已跟踪的区分开。
+    let tracked = bookmark.tracked;
 
     let element = div()
         .flex_none()
@@ -323,8 +326,9 @@ fn bookmark_element(bookmark: &jj::Bookmark, disabled: bool) -> AnyElement {
         .py_0()
         .rounded(px(4.))
         .border_1()
-        .border_color(color.opacity(0.55))
-        .bg(color.opacity(0.18))
+        .when(!tracked, |element| element.border_dashed())
+        .border_color(color.opacity(if tracked { 0.55 } else { 0.45 }))
+        .bg(color.opacity(if tracked { 0.18 } else { 0.06 }))
         .text_sm()
         .text_color(color)
         .child(Label::new(display_name).text_color(color));
@@ -551,6 +555,16 @@ impl ListDelegate for CommitListDelegate {
         for bookmark in &commit.bookmarks {
             bookmark_elements = bookmark_elements.child(bookmark_element(bookmark, disabled));
         }
+        // 这一行上「远程已有、本地没跟踪」的 bookmark：右键菜单给它们各来一个跟踪入口。
+        let untracked_remotes = commit
+            .bookmarks
+            .iter()
+            .filter(|bookmark| !bookmark.tracked)
+            .filter_map(|bookmark| match &bookmark.kind {
+                jj::BookmarkKind::Remote(remote) => Some((bookmark.name.clone(), remote.clone())),
+                jj::BookmarkKind::Local => None,
+            })
+            .collect::<Vec<_>>();
         let description_line = h_flex()
             .min_w_0()
             .gap_1()
@@ -660,6 +674,31 @@ impl ListDelegate for CommitListDelegate {
                                             });
                                         }
                                     }),
+                            )
+                            .when(
+                                !untracked_remotes.is_empty(),
+                                |menu| {
+                                    // 这些 bookmark 远程上有、本地没跟踪，推不动；就地跟踪一下。
+                                    let mut menu = menu.separator();
+                                    for (name, remote) in untracked_remotes.clone() {
+                                        let page = context_page.clone();
+                                        let label = format!("跟踪 {name}@{remote}（track）");
+                                        menu = menu.item(
+                                            PopupMenuItem::new(label)
+                                                .icon(IconName::Star)
+                                                .on_click(move |_, window, cx| {
+                                                    let name = name.clone();
+                                                    let remote = remote.clone();
+                                                    let _ = page.update(cx, |page, cx| {
+                                                        page.track_remote_bookmark(
+                                                            name, remote, window, cx,
+                                                        );
+                                                    });
+                                                }),
+                                        );
+                                    }
+                                    menu
+                                },
                             )
                         })
                         .w_full()
@@ -790,6 +829,7 @@ enum VcsOperation {
     Merge,
     AddRemote,
     CreateBookmark,
+    TrackRemote,
 }
 
 /// 操作失败时怎么把原因说出来。
@@ -1583,6 +1623,32 @@ impl VcsPage {
             },
             move |_| format!("已创建 bookmark {notification_name}"),
             ErrorReporting::Dialog("创建 bookmark 失败"),
+            window,
+            cx,
+        );
+    }
+
+    /// 跟踪一个「远程已有、本地没跟踪」的 bookmark，跟踪完就能推了。
+    fn track_remote_bookmark(
+        &mut self,
+        name: String,
+        remote: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let message_name = name.clone();
+        let message_remote = remote.clone();
+        let result_name = name.clone();
+        self.run_commit_op(
+            VcsOperation::TrackRemote,
+            move |path| {
+                jj::track_remote_bookmark(&path, &name, &remote)
+                    // 返回值只是给通知文案用的，这里用不上，回填个 bookmark 名字。
+                    .map(|()| result_name)
+                    .map_err(|error| format!("跟踪 bookmark 失败：{error}"))
+            },
+            move |_| format!("已跟踪 {message_name}@{message_remote}"),
+            ErrorReporting::Dialog("跟踪 bookmark 失败"),
             window,
             cx,
         );

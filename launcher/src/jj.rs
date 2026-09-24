@@ -10,27 +10,31 @@ use jj_lib::commit::Commit;
 use jj_lib::default_backend_factories::{
     default_backend_factories, default_working_copy_factories,
 };
-use jj_lib::fileset::FilesetAliasesMap;
+use jj_lib::fileset::{FilesetAliasesMap, FilesetDiagnostics, FilesetParseContext};
 use jj_lib::git::{
     GitFetch, GitFetchRefExpression, GitImportOptions, GitImportStats, GitProgress, GitPushOptions,
     GitPushRefTargets, GitPushStats, GitSettings, GitSidebandLineTerminator, GitSubprocessCallback,
     expand_fetch_refspecs, load_default_fetch_bookmarks, push_refs,
 };
+use jj_lib::gitignore::GitIgnoreFile;
+use jj_lib::matchers::NothingMatcher;
 use jj_lib::op_store::RefTarget;
-use jj_lib::ref_name::{RefName, RemoteName, RemoteNameBuf};
+use jj_lib::ref_name::{RefName, RemoteName, RemoteNameBuf, RemoteRefSymbol};
 use jj_lib::refs::{RefPushAction, classify_ref_push_action};
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo as _;
+use jj_lib::repo_path::RepoPath;
 use jj_lib::revset::{
     ResolvedRevsetExpression, RevsetAliasesMap, RevsetDiagnostics, RevsetExtensions,
     RevsetParseContext, RevsetWorkspaceContext, SymbolResolver, parse, parse_string_expression,
 };
 use jj_lib::rewrite::{RebaseOptions, merge_commit_trees};
-use jj_lib::settings::RemoteSettingsMap;
+use jj_lib::settings::{HumanByteSize, RemoteSettingsMap};
 use jj_lib::str_util::{StringExpression, StringMatcher};
 use jj_lib::time_util::DatePatternContext;
 use jj_lib::transaction::Transaction;
 use jj_lib::ui_path::RepoPathUiConverter;
+use jj_lib::working_copy::SnapshotOptions;
 use jj_lib::workspace::Workspace;
 use pollster::FutureExt as _;
 
@@ -54,6 +58,11 @@ pub struct CommitHistoryItem {
 pub struct Bookmark {
     pub name: String,
     pub kind: BookmarkKind,
+    /// 这个远程 bookmark 有没有被本地跟踪；本地 bookmark 恒为 `true`。
+    ///
+    /// 没跟踪的远程 bookmark 推不动（jj 要求先 track），列表里会显示得淡一些，
+    /// 右键那行可以就地跟踪。
+    pub tracked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,16 +223,205 @@ fn rebase_rewritten_descendants(
 
     // 不可变的提交（trunk、tag、别人推上来的 bookmark）不参与 rebase。
     let immutable = resolve_revset(repo, workspace, path, "immutable_heads()")?;
+    rebase_descendants_with(transaction, &immutable)
+}
+
+/// [`rebase_rewritten_descendants`] 的实体：immutable 集合已经解析好了。
+///
+/// 单独拆出来是因为快照要握着工作副本的锁做，那时候不能再从 `Workspace` 里借东西
+/// 去解析 revset。
+fn rebase_descendants_with(
+    transaction: &mut Transaction,
+    immutable: &Arc<ResolvedRevsetExpression>,
+) -> anyhow::Result<()> {
+    if !transaction.repo().has_rewrites() {
+        return Ok(());
+    }
+
     transaction
         .repo_mut()
-        .rebase_descendants_with_options(
-            &immutable,
-            &RebaseOptions::default(),
-            |_old_commit, _rebased_commit| {},
-        )
+        .rebase_descendants_with_options(immutable, &RebaseOptions::default(), |_, _| {})
         .block_on()
         .context("failed to rebase descendants")?;
     Ok(())
+}
+
+/// 某个提交在不在不可变集合里（trunk、tag、别人推上来的 bookmark 之类）。
+fn is_immutable_commit(
+    repo: &Arc<ReadonlyRepo>,
+    immutable: &Arc<ResolvedRevsetExpression>,
+    commit_id: &CommitId,
+) -> anyhow::Result<bool> {
+    let revset = immutable
+        .clone()
+        .evaluate(repo.as_ref())
+        .context("failed to evaluate the immutable revset")?;
+    let contains = revset.containing_fn();
+
+    futures::executor::block_on(contains(commit_id))
+        .context("failed to check whether the commit is immutable")
+}
+
+/// 快照时要跳过的忽略规则：git 的 `core.excludesFile`（或 `~/.config/git/ignore`）
+/// 加上 `.git/info/exclude`。
+///
+/// 仓库里的 `.gitignore` 由工作副本自己的 tree state 打理，不用在这里拼。
+fn base_ignores(store: &jj_lib::store::Store) -> anyhow::Result<Arc<GitIgnoreFile>> {
+    let mut ignores = GitIgnoreFile::empty();
+    let git_backend =
+        jj_lib::git::get_git_backend(store).context("repository is not Git-backed")?;
+    let git_repo = git_backend.git_repo();
+
+    let excludes_file = match git_repo.config_snapshot().string("core.excludesFile") {
+        // 配的是绝对路径居多；相对路径 git 会当成相对工作目录，这里也照做。
+        Some(value) => std::str::from_utf8(&value)
+            .ok()
+            .map(|path| Path::new(path).to_owned()),
+        None => Some(
+            std::env::var_os("XDG_CONFIG_HOME")
+                .filter(|value| !value.is_empty())
+                .map(std::path::PathBuf::from)
+                .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
+                .map(|config_home| config_home.join("git").join("ignore"))
+                .unwrap_or_default(),
+        ),
+    };
+    if let Some(path) = excludes_file.filter(|path| !path.as_os_str().is_empty()) {
+        let path = jj_lib::file_util::expand_home_path(&path.to_string_lossy());
+        ignores = ignores.chain_with_file(RepoPath::root(), path)?;
+    }
+    ignores = ignores.chain_with_file(
+        RepoPath::root(),
+        git_backend.git_repo_path().join("info").join("exclude"),
+    )?;
+
+    Ok(ignores)
+}
+
+/// `snapshot.auto-track` 配的是哪些新文件自动纳入跟踪（默认 `all()`）。
+fn auto_track_matcher(
+    path: &Path,
+    settings: &jj_lib::settings::UserSettings,
+) -> anyhow::Result<Box<dyn jj_lib::matchers::Matcher>> {
+    let text = settings
+        .get_string("snapshot.auto-track")
+        .unwrap_or_else(|_| "all()".to_owned());
+    let path_converter = RepoPathUiConverter::Fs {
+        cwd: path.to_owned(),
+        base: path.to_owned(),
+    };
+    let context = FilesetParseContext {
+        aliases_map: &FilesetAliasesMap::new(),
+        path_converter: &path_converter,
+    };
+    let expression = jj_lib::fileset::parse(&mut FilesetDiagnostics::new(), &text, &context)
+        .map_err(|error| anyhow!("无效的 snapshot.auto-track 配置 {text}：{error}"))?;
+
+    Ok(expression.to_matcher())
+}
+
+/// jj 默认的最大新文件大小（1MiB）。
+///
+/// 启动器读的是用户配置，没有 jj 那套默认配置层，所以缺这一项时用 jj 的默认值兜底。
+const DEFAULT_MAX_NEW_FILE_SIZE: u64 = 1024 * 1024;
+
+/// 把工作副本的文件改动记进当前提交（jj 的 "snapshot"）。
+///
+/// 启动器大部分时间只是在读提交图，没有这一步——所以从这里新建/提交/推送出去的提交
+/// 都是空树，推上去只有提交信息、没有文件。会动到内容的操作都先在这里补一次快照，
+/// 和 jj 命令行「每条命令前先快照」一个意思。返回快照之后（可能多了一个操作）的仓库。
+fn snapshot_working_copy(
+    workspace: &mut Workspace,
+    repo: &Arc<ReadonlyRepo>,
+    path: &Path,
+) -> anyhow::Result<Arc<ReadonlyRepo>> {
+    let settings = user_settings::create_user_settings(Some(path))?;
+    // 拿到工作副本的锁之后就不能再从 workspace 里借东西了，先把要用的都算出来。
+    let workspace_name = workspace.workspace_name().to_owned();
+    let wc_id = repo
+        .view()
+        .get_wc_commit_id(&workspace_name)
+        .cloned()
+        .context("working-copy commit not found")?;
+    let immutable = resolve_revset(repo, workspace, path, "immutable_heads()")?;
+    let max_new_file_size = settings
+        .get_value_with("snapshot.max-new-file-size", TryInto::try_into)
+        .map(|HumanByteSize(size)| size)
+        .unwrap_or(DEFAULT_MAX_NEW_FILE_SIZE);
+    // jj 里 0 表示不限制。
+    let max_new_file_size = if max_new_file_size == 0 {
+        u64::MAX
+    } else {
+        max_new_file_size
+    };
+    let auto_track = auto_track_matcher(path, &settings)?;
+    let options = SnapshotOptions {
+        base_ignores: base_ignores(repo.store())?,
+        progress: None,
+        start_tracking_matcher: auto_track.as_ref(),
+        force_tracking_matcher: &NothingMatcher,
+        max_new_file_size,
+    };
+
+    let mut locked_ws = workspace
+        .start_working_copy_mutation()
+        .block_on()
+        .context("the working copy is being modified elsewhere")?;
+    let (new_tree, _stats) = locked_ws
+        .locked_wc()
+        .snapshot(&options)
+        .block_on()
+        .context("failed to snapshot the working copy")?;
+
+    let wc_commit = repo
+        .store()
+        .get_commit(&wc_id)
+        .context("working-copy commit does not exist")?;
+    if new_tree.tree_ids_and_labels() == wc_commit.tree().tree_ids_and_labels() {
+        // 文件没变，锁还回去就行。
+        let repo = repo.clone();
+        locked_ws
+            .finish(repo.op_id().clone())
+            .block_on()
+            .context("failed to release the working copy")?;
+        return Ok(repo);
+    }
+
+    let mut transaction = repo.start_transaction();
+    // 工作副本提交本身是不可变提交（比如用户切到了 trunk 上）时不能改写它，
+    // 就在它上面新开一个——和 jj 命令行一样。
+    let wc_is_immutable = is_immutable_commit(repo, &immutable, wc_commit.id())?;
+    let new_wc_commit = if wc_is_immutable {
+        transaction
+            .repo_mut()
+            .new_commit(vec![wc_commit.id().clone()], new_tree)
+            .write()
+            .block_on()
+            .context("failed to create the snapshot commit")?
+    } else {
+        transaction
+            .repo_mut()
+            .rewrite_commit(&wc_commit)
+            .set_tree(new_tree)
+            .write()
+            .block_on()
+            .context("failed to record the snapshot")?
+    };
+    transaction
+        .repo_mut()
+        .set_wc_commit(workspace_name.clone(), new_wc_commit.id().clone())
+        .context("failed to select the snapshot commit")?;
+    rebase_descendants_with(&mut transaction, &immutable)?;
+    let repo = transaction
+        .commit("snapshot working copy")
+        .block_on()
+        .context("failed to save the snapshot")?;
+    locked_ws
+        .finish(repo.op_id().clone())
+        .block_on()
+        .context("failed to release the working copy")?;
+
+    Ok(repo)
 }
 
 /// 事务落盘后，工作副本落在哪个提交上。
@@ -292,6 +490,7 @@ pub fn load_history<P: AsRef<Path>>(path: P, revset_str: &str) -> anyhow::Result
                 .push(Bookmark {
                     name: name.as_str().to_owned(),
                     kind: BookmarkKind::Local,
+                    tracked: true,
                 });
         }
     }
@@ -303,6 +502,7 @@ pub fn load_history<P: AsRef<Path>>(path: P, revset_str: &str) -> anyhow::Result
                 .push(Bookmark {
                     name: symbol.name.as_str().to_owned(),
                     kind: BookmarkKind::Remote(symbol.remote.as_str().to_owned()),
+                    tracked: remote_ref.is_tracked(),
                 });
         }
     }
@@ -646,6 +846,9 @@ pub fn push_remote<P: AsRef<Path>>(path: P, remote: &str) -> anyhow::Result<Stri
         .load_at_head()
         .block_on()
         .context("failed to load repository")?;
+    // 推之前先快照：不然推上去的提交是空树，只有提交信息、没有文件。
+    let mut workspace = workspace;
+    let repo = snapshot_working_copy(&mut workspace, &repo, path)?;
     let mut transaction = repo.start_transaction();
 
     // 挑出要推的 ref。分类直接用 jj-lib 的，和 jj 命令行是同一套判断：
@@ -670,7 +873,9 @@ pub fn push_remote<P: AsRef<Path>>(path: P, remote: &str) -> anyhow::Result<Stri
                 skipped.push(format!("{bookmark}（远程那份有冲突，先拉取）"));
             }
             RefPushAction::RemoteUntracked => {
-                skipped.push(format!("{bookmark}（远程已有但本地没跟踪）"));
+                skipped.push(format!(
+                    "{bookmark}（远程已有但本地没跟踪，右键那行可以跟踪）"
+                ));
             }
         }
     }
@@ -721,6 +926,8 @@ pub fn checkout<P: AsRef<Path>>(path: P, commit_id: &str) -> anyhow::Result<()> 
         .load_at_head()
         .block_on()
         .context("failed to load repository")?;
+    // 切走之前先把磁盘上的改动记下来，不然它们会被目标提交的文件覆盖掉。
+    let repo = snapshot_working_copy(&mut workspace, &repo, path)?;
     let commit_id = parse_commit_id(commit_id)?;
     let commit = repo
         .store()
@@ -759,6 +966,8 @@ pub fn start_new_commit<P: AsRef<Path>>(path: P, commit_id: &str) -> anyhow::Res
         .load_at_head()
         .block_on()
         .context("failed to load repository")?;
+    // 先把当前改动记下来，再在目标提交上开新提交。
+    let repo = snapshot_working_copy(&mut workspace, &repo, path)?;
     let parent_id = parse_commit_id(commit_id)?;
     let parent = repo
         .store()
@@ -805,6 +1014,8 @@ pub fn commit_working_copy<P: AsRef<Path>>(path: P, message: &str) -> anyhow::Re
         .load_at_head()
         .block_on()
         .context("failed to load repository")?;
+    // 先把文件改动记进工作副本提交，写描述才是「把这些改动提交掉」。
+    let repo = snapshot_working_copy(&mut workspace, &repo, path)?;
     let wc_commit = working_copy_commit(&repo, &workspace)?;
 
     if wc_commit.description() == message {
@@ -867,6 +1078,8 @@ pub fn merge_commits<P: AsRef<Path>>(
         .load_at_head()
         .block_on()
         .context("failed to load repository")?;
+    // 合并前先记下当前改动，免得未记录的改动在切工作副本时丢掉。
+    let repo = snapshot_working_copy(&mut workspace, &repo, path)?;
     let first_id = parse_commit_id(first_parent)?;
     let second_id = parse_commit_id(second_parent)?;
     if first_id == second_id {
@@ -1000,6 +1213,49 @@ pub fn create_bookmark<P: AsRef<Path>>(path: P, name: &str, commit_id: &str) -> 
         .commit(format!("create bookmark {name}"))
         .block_on()
         .context("failed to save the bookmark")?;
+    Ok(())
+}
+
+/// 跟踪一个远程 bookmark（`jj bookmark track <name>@<remote>`）。
+///
+/// 跟踪之后它才算这个远程的对照，拉取/推送都会带上它；远程那份还没有本地 bookmark
+/// 时，这一步会顺手把本地 bookmark 建出来指向同一个提交。
+pub fn track_remote_bookmark<P: AsRef<Path>>(
+    path: P,
+    name: &str,
+    remote: &str,
+) -> anyhow::Result<()> {
+    let workspace = load_workspace(path.as_ref())?;
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .block_on()
+        .context("failed to load repository")?;
+    let name = RefName::new(name);
+    let remote = RemoteName::new(remote);
+
+    if repo
+        .view()
+        .get_remote_bookmark(RemoteRefSymbol { name, remote })
+        .is_absent()
+    {
+        anyhow::bail!("远程 {} 上没有 bookmark {}", remote.as_str(), name.as_str());
+    }
+
+    let mut transaction = repo.start_transaction();
+    transaction
+        .repo_mut()
+        .track_remote_bookmark(RemoteRefSymbol { name, remote })
+        .block_on()
+        .context("failed to track the remote bookmark")?;
+    transaction
+        .commit(format!(
+            "track remote bookmark {}@{}",
+            name.as_str(),
+            remote.as_str()
+        ))
+        .block_on()
+        .context("failed to save the tracked bookmark")?;
     Ok(())
 }
 
