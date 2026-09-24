@@ -1,6 +1,7 @@
-mod resource_dialog;
+pub(super) mod resource_dialog;
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use gpui_kit::base::{Disableable, StyledExt, h_flex, v_flex};
 use gpui_kit::component::WindowExt;
@@ -61,8 +62,10 @@ struct PackEntry {
 }
 
 /// 可以被勾选启停的资源类别，和项目下的目录一一对应。
+///
+/// 推送弹窗也要用这一套（同一个资源类别、同一套说法），所以对 `window` 模块可见。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PackKind {
+pub(crate) enum PackKind {
     /// `mods` 目录，`.jar` 文件。
     Mod,
     /// `resourcepacks` 目录，`.zip` 文件。
@@ -73,7 +76,7 @@ enum PackKind {
 
 impl PackKind {
     /// 侧边栏项对应的资源类别，「通用」页没有。
-    fn from_section(section: DevelopSection) -> Option<Self> {
+    pub(crate) fn from_section(section: DevelopSection) -> Option<Self> {
         match section {
             DevelopSection::Mods => Some(Self::Mod),
             DevelopSection::ResourcePacks => Some(Self::ResourcePack),
@@ -83,7 +86,7 @@ impl PackKind {
     }
 
     /// 在项目目录下的文件夹名。
-    fn dir_name(self) -> &'static str {
+    pub(crate) fn dir_name(self) -> &'static str {
         match self {
             Self::Mod => "mods",
             Self::ResourcePack => "resourcepacks",
@@ -100,7 +103,7 @@ impl PackKind {
     }
 
     /// 界面文案里的叫法。
-    fn noun(self) -> &'static str {
+    pub(crate) fn noun(self) -> &'static str {
         match self {
             Self::Mod => "模组",
             Self::ResourcePack => "资源包",
@@ -109,7 +112,7 @@ impl PackKind {
     }
 
     /// 序列化/反序列化用的资源类别，目录和 ext 跟这里保持一致。
-    fn resource_kind(self) -> ResourceKind {
+    pub(crate) fn resource_kind(self) -> ResourceKind {
         match self {
             Self::Mod => ResourceKind::Mod,
             Self::ResourcePack => ResourceKind::ResourcePack,
@@ -522,13 +525,31 @@ impl DevelopPage {
     /// 任务本身由弹窗负责启动和观察；没选项目（`pack_dir` 为空时按钮也不会渲染，
     /// 这里是双保险）就什么都不做。
     fn open_sync_dialog(&mut self, serialize: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // 已经有别的弹窗开着就别再叠一层了。
+        if window.has_active_dialog(cx) {
+            return;
+        }
         let Some(project) = self.project_select.selected_project().cloned() else {
             return;
         };
         let Some(kind) = PackKind::from_section(self.section) else {
             return;
         };
-        ResourceSyncDialog::open(&project, kind, serialize, cx.entity().downgrade(), window, cx);
+
+        let page = cx.entity().downgrade();
+        ResourceSyncDialog::open(
+            &project,
+            kind,
+            serialize,
+            Rc::new(move |window, cx| {
+                let Some(page) = page.upgrade() else {
+                    return;
+                };
+                page.update(cx, |page, cx| page.reload_packs(window, cx));
+            }),
+            window,
+            cx,
+        );
     }
 
     /// 强制同步按钮：删掉多余的一边，让资源文件和 toml 记录一一对应。

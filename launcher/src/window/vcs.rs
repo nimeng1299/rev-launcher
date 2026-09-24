@@ -4,6 +4,7 @@ use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListItem, ListState};
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_kit::component::notification::NotificationType;
+use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::searchable_list::SearchableListItem;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::tag::Tag;
@@ -17,8 +18,14 @@ use gpui_kit::{
     Subscription, WeakEntity, Window, div, hsla, px, svg,
 };
 use std::collections::HashSet;
+use std::rc::Rc;
+
+use mclib::detective::base::prune_records_without_file;
+use mclib::project::game_project::GameProject;
 
 use crate::jj;
+use crate::window::develop::PackKind;
+use crate::window::develop::resource_dialog::ResourceSyncDialog;
 use crate::window::project_select::{ProjectList, ProjectSelect};
 
 #[derive(Debug, Clone)]
@@ -1810,19 +1817,20 @@ impl VcsPage {
 
     /// 推送所有本地 bookmark 到当前远程。
     ///
-    /// 这一步会动远程仓库，所以先弹一个确认框；真正执行的是 [`Self::push_remote_now`]。
+    /// 这一步会动远程仓库，所以先弹一个确认框：框里可以就手序列化/同步资源、
+    /// 看一眼这次会带上去哪些改动，确认之后才真正执行（[`Self::push_remote_now`]）。
     fn open_push_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.operation.is_some() || window.has_active_dialog(cx) {
             return;
         }
 
-        if self.project_select.selected_path().is_none() {
+        let Some(project) = self.project_select.selected_project().cloned() else {
             window.push_notification(
                 (NotificationType::Error, "当前没有选中的整合包".to_owned()),
                 cx,
             );
             return;
-        }
+        };
         let Some(remote) = self.selected_remote.clone() else {
             window.push_notification(
                 (
@@ -1833,21 +1841,35 @@ impl VcsPage {
             );
             return;
         };
-        // 弹窗里点名是哪个整合包，免得用户在几个项目之间点错了还看不出来。
-        let project = self
-            .project_select
-            .selected_project()
-            .map(|project| project.name.clone())
-            .unwrap_or_else(|| "当前整合包".to_owned());
-
+        // 弹窗里点名是哪个整合包、推到哪个远程，免得用户在几个项目之间点错了还看不出来。
+        let title = format!("推送「{}」到 {remote}", project.name);
         let page = cx.entity().downgrade();
-        let confirm_remote = remote.clone();
+        let history_page = page.clone();
+        let content = cx.new(|cx| {
+            PushDialog::new(
+                project,
+                Rc::new(move |window, cx| {
+                    let Some(page) = history_page.upgrade() else {
+                        return;
+                    };
+                    page.update(cx, |page, cx| page.reload_history(window, cx));
+                }),
+                window,
+                cx,
+            )
+        });
+
         window.open_dialog(cx, move |dialog, _window, cx| {
             let page = page.clone();
-            let remote = confirm_remote.clone();
+            let content_for_footer = content.clone();
+            // 列表还在读、或者序列化还在跑的时候先别推：前者会跟后台那次数改动抢
+            // 工作副本的锁，后者推上去的可能是半截记录。
+            let pending = content.read(cx).is_loading() || content.read(cx).busy;
+
             dialog
-                .title("确认推送")
+                .title(title.clone())
                 .overlay_closable(true)
+                .w(px(700.))
                 .footer(
                     h_flex()
                         .w_full()
@@ -1858,32 +1880,18 @@ impl VcsPage {
                                 .label("取消")
                                 .on_click(|_, window, cx| window.close_dialog(cx)),
                         )
-                        .child(Button::new("push-confirm").label("推送").on_click(
-                            move |_, window, cx| {
-                                window.close_dialog(cx);
-                                let _ =
-                                    page.update(cx, |page, cx| page.push_remote_now(window, cx));
-                            },
-                        )),
-                )
-                .child(
-                    div()
-                        .v_flex()
-                        .gap_2()
-                        .child(Label::new(format!(
-                            "将把「{project}」的所有本地 bookmark 推送到远程 {remote}。"
-                        )))
                         .child(
-                            Label::new(format!(
-                                "会把「{project}」的所有本地 bookmark 推到远程 {remote}：远程上不存在的 \
-                                 会被新建，已存在的会被更新。推送前会先跟远程对账，远程那边已经动过就拒绝，\
-                                 不会盖掉别人的提交。\n推上去之后，如果你的提交上已经有了远程 bookmark，\
-                                 会自动开一个新的空提交，接着改的就是下一轮了。"
-                            ))
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground),
+                            Button::new("push-confirm")
+                                .label("推送")
+                                .disabled(pending)
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let _ = page
+                                        .update(cx, |page, cx| page.push_remote_now(window, cx));
+                                }),
                         ),
                 )
+                .child(content_for_footer)
         });
     }
 
@@ -2162,6 +2170,318 @@ impl VcsPage {
     }
 }
 
+/// 推送弹窗里可以就手跑的资源操作：三个类别，各一个「序列化」和「同步」。
+const PUSH_PACK_KINDS: [PackKind; 3] = [PackKind::Mod, PackKind::ResourcePack, PackKind::Shader];
+
+/// 改动列表一次显示这么多行，多的用滚轮翻。
+const PUSH_CHANGE_ROWS: f32 = 5.;
+
+/// 改动列表每行的高度；列表高度是行高乘行数，所以这里得是固定值。
+const PUSH_CHANGE_ROW_HEIGHT: f32 = 22.;
+
+/// 改动列表的加载状态。
+enum ChangesState {
+    Loading,
+    Loaded(jj::WorkingCopyChanges),
+    Failed(String),
+}
+
+/// 推送弹窗的内容：一行资源操作按钮 + 工作副本改动列表。
+///
+/// 单独做成一个 entity，是因为序列化/同步跑完之后要能只重画这一块：弹窗每次渲染
+/// 都是重新建的，内容得有地方存状态、有个东西在后台读完后来通知重画。
+struct PushDialog {
+    /// 当前项目：资源操作拿它扫目录，改动列表拿它读仓库。
+    project: GameProject,
+    /// 数改动前会给工作副本补一次快照，可能把当前提交换个 id；数完回调一次，
+    /// 让页面重读历史，免得列表里那个提交已经不是最新的了。
+    on_repo_changed: Rc<dyn Fn(&mut Window, &mut App)>,
+    /// 改动列表的请求号，后发起的那次说了算。
+    changes_request_id: u64,
+    changes: ChangesState,
+    /// 序列化正在跑（它的进度弹窗还开着），这期间按钮点不动。
+    busy: bool,
+}
+
+impl PushDialog {
+    fn new(
+        project: GameProject,
+        on_repo_changed: Rc<dyn Fn(&mut Window, &mut App)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut dialog = Self {
+            project,
+            on_repo_changed,
+            changes_request_id: 0,
+            changes: ChangesState::Loading,
+            busy: false,
+        };
+        dialog.reload_changes(window, cx);
+        dialog
+    }
+
+    /// 改动列表是不是还没读出来。
+    fn is_loading(&self) -> bool {
+        matches!(self.changes, ChangesState::Loading)
+    }
+
+    /// 后台重新数一遍工作副本相对父提交的改动。
+    ///
+    /// 数行数得读仓库里的内容，扔后台线程；回来时如果又发起过一次，这次的结果就丢掉。
+    fn reload_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.changes_request_id = self.changes_request_id.wrapping_add(1);
+        let request_id = self.changes_request_id;
+        let path = self.project.path.clone();
+        self.changes = ChangesState::Loading;
+
+        let dialog = cx.entity().downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    jj::working_copy_changes(&path)
+                        .map_err(|error| format!("读取改动列表失败：{error}"))
+                })
+                .await;
+
+            let _ = dialog.update_in(cx, |dialog, window, cx| {
+                if dialog.changes_request_id != request_id {
+                    return;
+                }
+                dialog.changes = match result {
+                    Ok(changes) => ChangesState::Loaded(changes),
+                    Err(error) => ChangesState::Failed(error),
+                };
+                // 这一次数改动之前补过快照，仓库很可能已经换了个当前提交。
+                (dialog.on_repo_changed)(window, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 「序列化」：和开发页同一个进度弹窗（扫资源目录、查平台指纹、写 toml 记录）。
+    ///
+    /// 写完的 toml 也是这次要推上去的东西，所以弹窗跑完要重数一遍改动列表。
+    fn serialize_packs(&mut self, kind: PackKind, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        // 按钮和「推送」都要立刻变成不可点，别等下一次别处发起的重画。
+        cx.notify();
+
+        let dialog = cx.entity().downgrade();
+        let on_finished: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(move |window, cx| {
+            let Some(dialog) = dialog.upgrade() else {
+                return;
+            };
+            dialog.update(cx, |dialog, cx| {
+                dialog.busy = false;
+                dialog.reload_changes(window, cx);
+            });
+        });
+
+        ResourceSyncDialog::open(&self.project, kind, true, on_finished, window, cx);
+    }
+
+    /// 「同步」：对应开发页的「删除多余记录」——以文件为准，删掉
+    /// `.rev_launcher/<目录>` 里没有对应资源文件的 toml 记录。
+    ///
+    /// 推之前先做这一步，远程才不会留下本地已经删掉的资源的记录。
+    fn prune_records(&mut self, kind: PackKind, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+
+        match prune_records_without_file(&self.project, kind.resource_kind()) {
+            Ok(deleted) if deleted.is_empty() => {
+                window.push_notification(
+                    (
+                        NotificationType::Info,
+                        "文件和记录已经一致，无需删除".to_owned(),
+                    ),
+                    cx,
+                );
+            }
+            Ok(deleted) => {
+                window.push_notification(
+                    (
+                        NotificationType::Success,
+                        format!("已删除 {} 个多余{}记录", deleted.len(), kind.noun()),
+                    ),
+                    cx,
+                );
+                // 记录少了，改动列表跟着变，重数一遍。
+                self.reload_changes(window, cx);
+            }
+            Err(error) => {
+                window
+                    .push_notification((NotificationType::Error, format!("同步失败：{error}")), cx);
+            }
+        }
+    }
+
+    /// 一行资源操作：模组/资源包/光影，各一个「序列化」和「同步」。
+    fn render_pack_actions(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let mut row = h_flex().w_full().items_center().gap_3();
+
+        for (index, kind) in PUSH_PACK_KINDS.into_iter().enumerate() {
+            let noun = kind.noun();
+            let dir = kind.dir_name();
+            row = row.child(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(Label::new(noun).text_sm().text_color(muted))
+                    .child(
+                        Button::new(("push-serialize", index))
+                            .compact()
+                            .label("序列化")
+                            .tooltip(format!(
+                                "把 {dir} 里的文件写成 .rev_launcher 下的 toml 记录"
+                            ))
+                            .disabled(self.busy)
+                            .on_click(cx.listener(move |dialog, _, window, cx| {
+                                dialog.serialize_packs(kind, window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new(("push-prune-records", index))
+                            .compact()
+                            .label("同步")
+                            .tooltip(format!("删掉 {dir} 里没有对应文件的 toml 记录"))
+                            .disabled(self.busy)
+                            .on_click(cx.listener(move |dialog, _, window, cx| {
+                                dialog.prune_records(kind, window, cx);
+                            })),
+                    ),
+            );
+        }
+
+        row
+    }
+
+    /// 改动列表：工作副本相对父提交改了哪些文件、各增删多少行。
+    ///
+    /// 最多显示 [`PUSH_CHANGE_ROWS`] 行，多的用滚轮翻——推送前扫一眼就够，
+    /// 不该让一个几百行的列表把弹窗撑开。
+    fn render_changes(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let added_color = cx.theme().success;
+        let removed_color = cx.theme().danger;
+        let mut panel = div().v_flex().w_full().min_w_0().gap_1();
+
+        match &self.changes {
+            ChangesState::Loading => {
+                panel = panel.child(
+                    Label::new("正在读工作副本的改动…")
+                        .text_sm()
+                        .text_color(muted),
+                );
+            }
+            ChangesState::Failed(error) => {
+                panel = panel.child(
+                    Label::new(error.clone())
+                        .text_sm()
+                        .text_color(cx.theme().danger),
+                );
+            }
+            ChangesState::Loaded(changes) if changes.files.is_empty() => {
+                panel = panel.child(Label::new("工作副本没有改动").text_sm().text_color(muted));
+            }
+            ChangesState::Loaded(changes) => {
+                let total = changes.total;
+                let shown = changes.files.len();
+                panel =
+                    panel
+                        .child(
+                            Label::new(if total > shown {
+                                format!("改动 {total} 个文件，只列出前 {shown} 个")
+                            } else {
+                                format!("改动 {total} 个文件")
+                            })
+                            .text_sm()
+                            .text_color(muted),
+                        )
+                        .child(
+                            div()
+                                .id("push-changes")
+                                .debug_selector(|| "push-changes".to_owned())
+                                .v_flex()
+                                .w_full()
+                                .max_h(px(PUSH_CHANGE_ROW_HEIGHT * PUSH_CHANGE_ROWS))
+                                .overflow_y_scrollbar()
+                                .children(changes.files.iter().map(|file| {
+                                    change_row(file, muted, added_color, removed_color)
+                                })),
+                        );
+            }
+        }
+
+        panel
+    }
+}
+
+/// 改动列表的一行：路径 + 增删行数；二进制文件数不出行数，只标一下。
+fn change_row(
+    file: &jj::ChangedFile,
+    muted: Hsla,
+    added_color: Hsla,
+    removed_color: Hsla,
+) -> impl IntoElement {
+    let counts: AnyElement = match file.lines {
+        Some((added, removed)) => h_flex()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .child(
+                Label::new(format!("+{added}"))
+                    .text_sm()
+                    .text_color(added_color),
+            )
+            .child(
+                Label::new(format!("-{removed}"))
+                    .text_sm()
+                    .text_color(removed_color),
+            )
+            .into_any_element(),
+        None => Label::new("二进制")
+            .text_sm()
+            .text_color(muted)
+            .into_any_element(),
+    };
+
+    h_flex()
+        .h(px(PUSH_CHANGE_ROW_HEIGHT))
+        .w_full()
+        .min_w_0()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .child(Label::new(file.path.clone()).text_sm()),
+        )
+        .child(counts)
+}
+
+impl Render for PushDialog {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_3()
+            .child(self.render_pack_actions(cx))
+            .child(self.render_changes(cx))
+    }
+}
+
 impl Render for VcsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_selection(window, cx);
@@ -2266,6 +2586,8 @@ impl Render for VcsPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_kit::TestAppContext;
+    use mclib::project::game_project::ModLoader;
 
     fn commit(id: &str, parents: &[&str]) -> jj::CommitHistoryItem {
         jj::CommitHistoryItem {
@@ -2404,6 +2726,58 @@ mod tests {
         assert_eq!(
             EmptyState::Failure("读取提交历史失败：坏了".to_owned()).message(),
             "读取提交历史失败：坏了"
+        );
+    }
+
+    /// 只渲染推送弹窗内容的宿主，用来把这块内容真的跑一遍布局。
+    struct PushDialogHost {
+        content: Entity<PushDialog>,
+    }
+
+    impl Render for PushDialogHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.content.clone())
+        }
+    }
+
+    /// 改动比列表能显示的多时，列表高度得停在五行上，剩下的靠滚轮翻。
+    #[gpui_kit::test]
+    fn push_dialog_caps_the_change_list_at_five_rows(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path();
+        jj::init_git_backend(path).expect("init the git backend");
+        // 八个新文件：比五行多，列表就该封顶。
+        for index in 0..8 {
+            std::fs::write(path.join(format!("note-{index}.txt")), "line\n").expect("write note");
+        }
+        let project = GameProject {
+            name: "测试整合包".to_owned(),
+            version: "1.0".to_owned(),
+            path: path.to_path_buf(),
+            game_version: "1.20.1".to_owned(),
+            loader: ModLoader::Fabric,
+            loader_version: "0.15.1".to_owned(),
+        };
+
+        let (_, cx) = cx.add_window_view(|window, cx| PushDialogHost {
+            content: cx.new(|cx| PushDialog::new(project, Rc::new(|_, _| {}), window, cx)),
+        });
+        // 等后台那次「数改动」落地，再画一遍。
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let list = cx.debug_bounds("push-changes").expect("改动列表应该在");
+        assert!(list.size.height > px(0.));
+        assert!(
+            list.size.height <= px(PUSH_CHANGE_ROW_HEIGHT * PUSH_CHANGE_ROWS + 1.),
+            "列表最多显示 {} 行，实际 {}px",
+            PUSH_CHANGE_ROWS,
+            list.size.height
         );
     }
 }

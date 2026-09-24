@@ -5,6 +5,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
+use futures::AsyncReadExt as _;
 use jj_lib::backend::CommitId;
 use jj_lib::commit::Commit;
 use jj_lib::default_backend_factories::{
@@ -17,7 +18,7 @@ use jj_lib::git::{
     expand_fetch_refspecs, load_default_fetch_bookmarks, push_refs,
 };
 use jj_lib::gitignore::GitIgnoreFile;
-use jj_lib::matchers::NothingMatcher;
+use jj_lib::matchers::{EverythingMatcher, NothingMatcher};
 use jj_lib::op_store::RefTarget;
 use jj_lib::ref_name::{RefName, RemoteName, RemoteNameBuf, RemoteRefSymbol};
 use jj_lib::refs::{RefPushAction, classify_ref_push_action};
@@ -80,6 +81,24 @@ pub struct CommitHistory {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitBackendInfo {
     pub branch: Option<String>,
+}
+
+/// 工作副本相对父提交改动的一个文件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedFile {
+    /// 相对仓库根的路径，用 `/` 分隔。
+    pub path: String,
+    /// `(新增行数, 删除行数)`；`None` 表示二进制、太大，或者本来就不是能按行数的一般文件。
+    pub lines: Option<(usize, usize)>,
+}
+
+/// 工作副本相对父提交的全部改动；推送前拿它给用户看一眼「这次会带上去什么」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkingCopyChanges {
+    /// 改动文件，按路径排序；最多 [`MAX_CHANGED_FILES`] 个。
+    pub files: Vec<ChangedFile>,
+    /// 改动文件总数，比 `files.len()` 大就说明后面还有没列出来的。
+    pub total: usize,
 }
 
 fn load_workspace(path: &Path) -> anyhow::Result<Workspace> {
@@ -1174,6 +1193,140 @@ pub fn working_copy_description<P: AsRef<Path>>(path: P) -> anyhow::Result<Optio
     Ok((!description.trim().is_empty()).then_some(description))
 }
 
+/// 推送弹窗最多列出这么多改动文件，剩下的只报个数。
+const MAX_CHANGED_FILES: usize = 200;
+
+/// diff 的一边最多读这么多字节来数行数，再大的文件就不数了。
+const MAX_DIFF_FILE_BYTES: usize = 2 * 1024 * 1024;
+
+/// 这些后缀一律当二进制，连内容都不用读——整合包里的大头就是 mods 的 jar 和资源包的 zip。
+const BINARY_EXTS: &[&str] = &[
+    "jar", "zip", "png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "tga", "ogg", "oga", "mp3",
+    "wav", "flac", "mp4", "mkv", "avi", "mov", "dll", "exe", "so", "dylib", "bin", "dat", "pdf",
+    "7z", "rar", "gz", "xz", "zst", "ttf", "otf", "woff", "woff2", "class", "nbt", "mca", "pak",
+];
+
+/// 工作副本相对父提交改了哪些文件、每个文件增删多少行。
+///
+/// 推送前要让用户知道这次会带上去什么，所以先补一次快照（工作副本里的改动得先记进
+/// 提交才数得出来，和别的会动内容的操作一样），再拿工作副本提交和它的父提交比。
+/// 行数按行 diff 数出来；二进制和超大文件只报文件名，数了也没意义、还慢。
+///
+/// 要动工作副本的锁、还要读仓库里的内容，调用方放后台线程里跑。
+pub fn working_copy_changes<P: AsRef<Path>>(path: P) -> anyhow::Result<WorkingCopyChanges> {
+    let path = path.as_ref();
+    let mut workspace = load_workspace(path)?;
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .block_on()
+        .context("failed to load repository")?;
+    let repo = snapshot_working_copy(&mut workspace, &repo, path)?;
+    let wc_commit = working_copy_commit(&repo, &workspace)?;
+    // 工作副本提交可能是个合并提交，父提交的树要先合起来才是「改动前」的样子。
+    let base_tree = wc_commit
+        .parent_tree(repo.as_ref())
+        .block_on()
+        .context("failed to read the parent tree")?;
+    let tree = wc_commit.tree();
+    let store = repo.store().clone();
+
+    futures::executor::block_on(async move {
+        let mut stream = base_tree.diff_stream(&tree, &EverythingMatcher);
+        let mut files = Vec::new();
+        let mut total = 0;
+        while let Some(entry) = futures::StreamExt::next(&mut stream).await {
+            let values = entry.values.context("failed to diff the working copy")?;
+            total += 1;
+            // 刚建仓库时整个整合包都是新文件，列表没必要把所有文件都数一遍。
+            if files.len() >= MAX_CHANGED_FILES {
+                continue;
+            }
+
+            let before = read_diff_side(&values.before, &store, &entry.path).await?;
+            let after = read_diff_side(&values.after, &store, &entry.path).await?;
+            let lines = match (before, after) {
+                (Some(before), Some(after)) => Some(count_changed_lines(&before, &after)),
+                _ => None,
+            };
+            files.push(ChangedFile {
+                path: entry.path.as_internal_file_string().to_owned(),
+                lines,
+            });
+        }
+
+        Ok::<_, anyhow::Error>(WorkingCopyChanges { files, total })
+    })
+}
+
+/// 按后缀判断是不是二进制文件。
+fn is_binary_path(path: &str) -> bool {
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    let Some((_, ext)) = file_name.rsplit_once('.') else {
+        return false;
+    };
+
+    BINARY_EXTS
+        .iter()
+        .any(|known| ext.eq_ignore_ascii_case(known))
+}
+
+/// 读 diff 的一边准备数行数。
+///
+/// 返回 `None` 表示这一边数不出行数：二进制、太大，或者本来就不是一般文件（冲突、
+/// 软链接、子模块、目录）。文件在这一边不存在时返回空内容，这样新增的文件数出来
+/// 就是「全部新增」、删掉的文件就是「全部删除」。
+async fn read_diff_side(
+    value: &jj_lib::merge::Merge<Option<jj_lib::backend::TreeValue>>,
+    store: &Arc<jj_lib::store::Store>,
+    path: &RepoPath,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(resolved) = value.as_resolved() else {
+        // 合并冲突：两边内容对不上，没有单一的「改动前/后」。
+        return Ok(None);
+    };
+    let Some(jj_lib::backend::TreeValue::File { id, .. }) = resolved else {
+        // `None` 是这一边没这个文件，其它是软链接/子模块/目录。
+        return Ok(resolved.is_none().then(Vec::new));
+    };
+    if is_binary_path(path.as_internal_file_string()) {
+        return Ok(None);
+    }
+
+    let reader = store
+        .read_file(path, id)
+        .await
+        .context("failed to read a file from the store")?;
+    let mut contents = Vec::new();
+    reader
+        .take((MAX_DIFF_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut contents)
+        .await
+        .context("failed to read a file from the store")?;
+    // 读到上限说明文件比上限大；前 8KB 里有 NUL 就是二进制。
+    if contents.len() > MAX_DIFF_FILE_BYTES || contents.iter().take(8000).any(|byte| *byte == 0) {
+        return Ok(None);
+    }
+
+    Ok(Some(contents))
+}
+
+/// 两份内容按行 diff，数出新增和删除的行数。
+fn count_changed_lines(before: &[u8], after: &[u8]) -> (usize, usize) {
+    let diff = jj_lib::diff::ContentDiff::by_line([before, after]);
+    let (mut added, mut removed) = (0, 0);
+    for hunk in diff.hunk_ranges() {
+        if hunk.kind != jj_lib::diff::DiffHunkKind::Different {
+            continue;
+        }
+        // 两个输入按顺序给范围：第 0 个是改动前，第 1 个是改动后。
+        removed += jj_lib::diff::find_line_ranges(&before[hunk.ranges[0].clone()]).len();
+        added += jj_lib::diff::find_line_ranges(&after[hunk.ranges[1].clone()]).len();
+    }
+
+    (added, removed)
+}
+
 /// 合并两个提交：新建一个以它们为父的合并提交，并把工作副本切过去（`jj new A B`）。
 ///
 /// 两边都改过的文件会留下冲突（和 jj 一样，冲突交给用户之后处理）。`first_parent`
@@ -1592,5 +1745,67 @@ mod tests {
         assert!(parse_name_pattern("release-*").is_ok());
         // 模式语法坏了要报错，而不是当成字面量悄悄用。
         assert!(parse_name_pattern("(").is_err());
+    }
+
+    #[test]
+    fn count_changed_lines_numbers_the_two_sides() {
+        // 没改就是 0/0。
+        assert_eq!(count_changed_lines(b"a\nb\n", b"a\nb\n"), (0, 0));
+        // 换掉一行：删一行加一行。
+        assert_eq!(count_changed_lines(b"a\nb\nc\n", b"a\nB\nc\n"), (1, 1));
+        // 多写两行：只加不删。
+        assert_eq!(count_changed_lines(b"a\n", b"a\nb\nc\n"), (2, 0));
+        // 删掉两行：只删不加。
+        assert_eq!(count_changed_lines(b"a\nb\nc\n", b"a\n"), (0, 2));
+        // 新文件（空的一边）：整份都算新增。
+        assert_eq!(count_changed_lines(b"", b"a\nb\n"), (2, 0));
+    }
+
+    #[test]
+    fn is_binary_path_looks_at_the_extension_only() {
+        assert!(is_binary_path("pack.jar"));
+        assert!(is_binary_path("mods/sodium.JAR"));
+        assert!(!is_binary_path("config/keep.json"));
+        // 目录名里的点不能当后缀使。
+        assert!(!is_binary_path("pack.v2/README"));
+        assert!(!is_binary_path("noext"));
+    }
+
+    #[test]
+    fn working_copy_changes_lists_new_and_edited_files_with_line_counts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path();
+        init_git_backend(path).expect("init the git backend");
+        std::fs::write(path.join("notes.txt"), "one\ntwo\n").expect("write notes");
+        std::fs::write(path.join("pack.jar"), [0u8, 1, 2, 3]).expect("write pack");
+
+        // 刚建仓库：内容都还在当前提交里，相对父提交就是「几个新文件」。
+        let changes = working_copy_changes(path).expect("read the changes");
+        assert_eq!(file_lines(&changes, "notes.txt"), Some((2, 0)));
+        assert_eq!(
+            file_lines(&changes, "pack.jar"),
+            None,
+            "jar 当二进制，不数行数"
+        );
+
+        // 把这一版提交掉、再在它上面开一个新提交改一行：
+        // 这才是「相对父提交改了哪几行」。
+        let committed = commit_working_copy(path, "first").expect("commit");
+        start_new_commit(path, &committed).expect("new");
+        std::fs::write(path.join("notes.txt"), "one\nTWO\nthree\n").expect("write notes");
+
+        let changes = working_copy_changes(path).expect("read the changes");
+        assert_eq!(changes.total, 1, "只有 notes.txt 变了：{:?}", changes.files);
+        assert_eq!(file_lines(&changes, "notes.txt"), Some((2, 1)));
+    }
+
+    /// 测试里按路径取一个改动文件的行数；没有这个文件就是测试写错了。
+    fn file_lines(changes: &WorkingCopyChanges, path: &str) -> Option<(usize, usize)> {
+        changes
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .unwrap_or_else(|| panic!("{path} 不在改动列表里：{:?}", changes.files))
+            .lines
     }
 }

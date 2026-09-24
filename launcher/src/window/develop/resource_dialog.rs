@@ -7,8 +7,12 @@
 //!   弹窗轮询下载任务状态展示每个文件的进度。
 //!
 //! 任务在弹窗打开时就已经开始，关掉弹窗只丢接收端，不中断磁盘写入或下载。
+//!
+//! 弹窗不认开发页：跑完只是回调一下 `on_finished`，谁打开的谁自己决定要刷新什么
+//! （开发页重扫资源列表，推送弹窗重数一遍工作副本的改动）。
 
 use std::collections::VecDeque;
+use std::rc::Rc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
@@ -19,8 +23,8 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{ActiveTheme, Sizable, StyledExt, WindowExt};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    AppContext, Context, FocusHandle, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, Styled, WeakEntity, Window, div, px, uniform_list,
+    App, AppContext, Context, FocusHandle, InteractiveElement, IntoElement, ParentElement, Render,
+    SharedString, Styled, Window, div, px, uniform_list,
 };
 
 use mclib::detective::base::{
@@ -31,7 +35,7 @@ use mclib::project::game_project::GameProject;
 use sharingan::downloader::Downloader;
 use sharingan::status::{DownloadFailure, DownloadStatus};
 
-use super::{DevelopPage, PackKind};
+use super::PackKind;
 
 /// 序列化时保留在弹窗里的最近处理文件名数量。
 const RECENT_FILES: usize = 30;
@@ -197,7 +201,7 @@ fn file_rows(downloader: &Downloader) -> Vec<FileRow> {
     rows
 }
 
-pub(super) struct ResourceSyncDialog {
+pub(crate) struct ResourceSyncDialog {
     title: String,
     noun: &'static str,
     /// 后台任务；`None` 时任务没起来，`error` 里有原因。
@@ -207,10 +211,10 @@ pub(super) struct ResourceSyncDialog {
     error: Option<String>,
     /// 反序列化整体结束标记：任务表全部进入终态。
     deserialize_finished: bool,
-    /// 是否已经回调页面重扫过资源列表。
+    /// 是否已经回调过调用方。
     notified: bool,
-    /// 结束（成功或失败）后回调页面重扫一次资源列表。
-    page: WeakEntity<DevelopPage>,
+    /// 结束（成功或失败）后回调一次，让调用方把自己的列表刷回磁盘状态。
+    on_finished: Rc<dyn Fn(&mut Window, &mut App)>,
     focus_handle: FocusHandle,
 }
 
@@ -220,7 +224,7 @@ impl ResourceSyncDialog {
         project: &GameProject,
         kind: ResourceKind,
         noun: &'static str,
-        page: WeakEntity<DevelopPage>,
+        on_finished: Rc<dyn Fn(&mut Window, &mut App)>,
         cx: &mut Context<Self>,
     ) -> Self {
         let (task, error) = match serialize_resources(project, kind) {
@@ -235,7 +239,7 @@ impl ResourceSyncDialog {
             error,
             deserialize_finished: false,
             notified: false,
-            page,
+            on_finished,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -245,7 +249,7 @@ impl ResourceSyncDialog {
         project: &GameProject,
         kind: ResourceKind,
         noun: &'static str,
-        page: WeakEntity<DevelopPage>,
+        on_finished: Rc<dyn Fn(&mut Window, &mut App)>,
         cx: &mut Context<Self>,
     ) -> Self {
         let (task, error) = match deserialize_resources(project, kind, DOWNLOAD_THREADS) {
@@ -260,31 +264,30 @@ impl ResourceSyncDialog {
             error,
             deserialize_finished: false,
             notified: false,
-            page,
+            on_finished,
             focus_handle: cx.focus_handle(),
         }
     }
 
     /// 打开弹窗；任务此时已在跑，弹窗只是观察进度。
-    pub(super) fn open(
+    ///
+    /// 这里不看有没有别的弹窗：开发页的工具栏调用前自己会看，推送弹窗则要压在它上面。
+    pub(crate) fn open<P: 'static>(
         project: &GameProject,
         kind: PackKind,
         serialize: bool,
-        page: WeakEntity<DevelopPage>,
+        on_finished: Rc<dyn Fn(&mut Window, &mut App)>,
         window: &mut Window,
-        cx: &mut Context<DevelopPage>,
+        cx: &mut Context<P>,
     ) {
-        if window.has_active_dialog(cx) {
-            return;
-        }
         let noun = kind.noun();
         let resource_kind = kind.resource_kind();
 
         let dialog = cx.new(|cx| {
             let dialog = if serialize {
-                Self::serialize(project, resource_kind, noun, page, cx)
+                Self::serialize(project, resource_kind, noun, on_finished, cx)
             } else {
-                Self::deserialize(project, resource_kind, noun, page, cx)
+                Self::deserialize(project, resource_kind, noun, on_finished, cx)
             };
             dialog.start_poll(window, cx);
             dialog
@@ -339,23 +342,25 @@ impl ResourceSyncDialog {
         self.error.is_some() || self.serialize.finished
     }
 
-    /// 后台轮询：每 150ms 同步一次任务进度，结束后让页面重扫资源列表。
+    /// 后台轮询：每 150ms 同步一次任务进度，结束后回调一次调用方。
     fn start_poll(&self, window: &mut Window, cx: &mut Context<Self>) {
-        cx.spawn_in(window, async move |view, cx| {
+        // 轮询自己握着弹窗的强引用：任务跑完还要回调调用方，哪怕用户先把弹窗关了
+        // （外面的引用就没了），回调也不能半路失踪——不然调用方那边的「正在跑」
+        // 状态永远解不开。
+        let dialog = cx.entity();
+        cx.spawn_in(window, async move |_, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(150))
                     .await;
-                let running = view
+                let running = dialog
                     .update_in(cx, |dialog, window, cx| {
                         let finished = dialog.poll_progress(cx);
                         if finished && !dialog.notified {
                             dialog.notified = true;
                             // 序列化写了 toml、反序列化落了资源文件，
-                            // 都让列表回到磁盘状态。
-                            let _ = dialog.page.update(cx, |page, cx| {
-                                page.reload_packs(window, cx);
-                            });
+                            // 都让调用方把自己的列表回到磁盘状态。
+                            (dialog.on_finished)(window, cx);
                         }
                         cx.notify();
                         !finished
