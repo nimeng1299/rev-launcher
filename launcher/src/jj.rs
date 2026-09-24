@@ -897,19 +897,34 @@ pub fn push_remote<P: AsRef<Path>>(path: P, remote: &str) -> anyhow::Result<Stri
 
     // 有推成功的就先把结果落盘（jj 命令行也是这个顺序）：一部分被拒时，
     // 成功的那部分不能白推，不然下次还会被当成没推过。
+    let mut repo = None;
     if stats.all_ok() || stats.some_exported() {
-        transaction
-            .commit(format!("push all bookmarks to git remote {remote}"))
-            .block_on()
-            .context("failed to save push result")?;
+        repo = Some(
+            transaction
+                .commit(format!("push all bookmarks to git remote {remote}"))
+                .block_on()
+                .context("failed to save push result")?,
+        );
     }
 
     let summary = summarize_push(&stats, &skipped, remote);
-    if stats.all_ok() {
-        Ok(summary)
-    } else {
-        Err(anyhow!(summary))
+    if !stats.all_ok() {
+        return Err(anyhow!(summary));
     }
+
+    // 真推上去了东西、而且工作副本提交现在有远程 bookmark：顺手开一个新的出来，
+    // 接下来的改动不会又落进已经推上去的提交里。
+    let repo = repo.expect("push 成功就一定有落盘");
+    let new_commit_id = if stats.pushed.is_empty() {
+        None
+    } else {
+        start_new_commit_after_push(&mut workspace, &repo, path)?
+    };
+
+    Ok(match new_commit_id {
+        Some(new_commit_id) => format!("{summary}；已新建提交 {new_commit_id:.8} 继续"),
+        None => summary,
+    })
 }
 
 /// 把界面上的提交 id（十六进制字符串）解析成 [`CommitId`]。
@@ -969,9 +984,23 @@ pub fn start_new_commit<P: AsRef<Path>>(path: P, commit_id: &str) -> anyhow::Res
     // 先把当前改动记下来，再在目标提交上开新提交。
     let repo = snapshot_working_copy(&mut workspace, &repo, path)?;
     let parent_id = parse_commit_id(commit_id)?;
+
+    let (_, new_commit_id) = create_child_commit(&mut workspace, &repo, path, &parent_id)?;
+    Ok(new_commit_id)
+}
+
+/// 在 `parent_id` 上开一个新的空提交，并让它成为工作副本（`jj new <parent>`）。
+///
+/// 返回（新仓库, 新提交 id）。推完顺手开新提交那种场景也走这里。
+fn create_child_commit(
+    workspace: &mut Workspace,
+    repo: &Arc<ReadonlyRepo>,
+    path: &Path,
+    parent_id: &CommitId,
+) -> anyhow::Result<(Arc<ReadonlyRepo>, String)> {
     let parent = repo
         .store()
-        .get_commit(&parent_id)
+        .get_commit(parent_id)
         .context("commit does not exist")?;
 
     let mut transaction = repo.start_transaction();
@@ -988,18 +1017,42 @@ pub fn start_new_commit<P: AsRef<Path>>(path: P, commit_id: &str) -> anyhow::Res
         .context("failed to select the new commit")?;
     // 原地新建时（右键的就是当前工作副本）没什么要 rebase 的；但如果原来那个空的
     // 工作副本提交被放弃了，这里得把它的后代 rebase 好才能提交事务。
-    rebase_rewritten_descendants(&mut transaction, &repo, &workspace, path)?;
+    rebase_rewritten_descendants(&mut transaction, repo, workspace, path)?;
     let repo = transaction
         .commit(format!("new commit on {parent_id}"))
         .block_on()
         .context("failed to save the new commit")?;
 
-    let new_commit = working_copy_commit(&repo, &workspace)?;
+    let new_commit = working_copy_commit(&repo, workspace)?;
     workspace
         .check_out(repo.op_id().clone(), None, &new_commit)
         .block_on()
         .context("failed to update working copy")?;
-    Ok(new_commit.id().to_string())
+    Ok((repo, new_commit.id().to_string()))
+}
+
+/// 推完之后：要是工作副本提交上已经有远程 bookmark（说明它已经在远程上了），
+/// 就在它上面开一个新的，接下来的改动不会又落回已经推上去的提交里。
+///
+/// 返回新提交 id；不用开的时候返回 `None`。
+fn start_new_commit_after_push(
+    workspace: &mut Workspace,
+    repo: &Arc<ReadonlyRepo>,
+    path: &Path,
+) -> anyhow::Result<Option<String>> {
+    let wc_commit = working_copy_commit(repo, workspace)?;
+    let is_pushed = repo.view().all_remote_bookmarks().any(|(_, remote_ref)| {
+        remote_ref
+            .target
+            .added_ids()
+            .any(|commit_id| commit_id == wc_commit.id())
+    });
+    if !is_pushed {
+        return Ok(None);
+    }
+
+    let (_, new_commit_id) = create_child_commit(workspace, repo, path, wc_commit.id())?;
+    Ok(Some(new_commit_id))
 }
 
 /// 提交工作副本：给当前工作副本提交写上描述，不改动它在图上的位置。

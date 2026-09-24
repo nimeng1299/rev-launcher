@@ -1877,7 +1877,8 @@ impl VcsPage {
                             Label::new(format!(
                                 "会把「{project}」的所有本地 bookmark 推到远程 {remote}：远程上不存在的 \
                                  会被新建，已存在的会被更新。推送前会先跟远程对账，远程那边已经动过就拒绝，\
-                                 不会盖掉别人的提交。"
+                                 不会盖掉别人的提交。\n推上去之后，如果你的提交上已经有了远程 bookmark，\
+                                 会自动开一个新的空提交，接着改的就是下一轮了。"
                             ))
                             .text_sm()
                             .text_color(cx.theme().muted_foreground),
