@@ -3,9 +3,9 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListItem, ListState};
 use gpui_kit::component::notification::NotificationType;
-use gpui_kit::component::select::{Select, SelectEvent};
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::tag::Tag;
-use gpui_kit::component::{ActiveTheme, IndexPath, StyledExt, WindowExt, h_flex};
+use gpui_kit::component::{ActiveTheme, Disableable, IndexPath, StyledExt, WindowExt, h_flex};
 use gpui_kit::{
     AnyElement, App, AppContext, ClickEvent, Context, Entity, Hsla, InteractiveElement,
     IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
@@ -593,17 +593,68 @@ impl ListDelegate for CommitListDelegate {
     }
 }
 
+/// 工具栏上的两个远程操作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteCommand {
+    Fetch,
+    Push,
+}
+
+impl RemoteCommand {
+    /// 通知文案里用的名字。
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fetch => "拉取",
+            Self::Push => "推送",
+        }
+    }
+}
+
+/// 页面上正在跑的仓库操作。
+///
+/// 同一时刻只允许一个：切换提交、移动 bookmark、拉取、推送都会改工作副本或者仓库
+/// 状态，串起来才不会互相踩。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VcsOperation {
+    Checkout,
+    MoveBookmark,
+    Remote(RemoteCommand),
+}
+
+/// 远程列表更新后该选中哪个：原来选中的还在就用它，否则退回第一个。
+fn resolve_remote(remotes: &[String], previous: Option<String>) -> Option<String> {
+    previous
+        .filter(|name| remotes.iter().any(|remote| remote == name))
+        .or_else(|| remotes.first().cloned())
+}
+
+/// 远程名在下拉框选项里的下标，也就是下拉框的选中项。
+fn remote_index(remotes: &[String], remote: Option<&String>) -> Option<IndexPath> {
+    remote
+        .and_then(|remote| remotes.iter().position(|name| name == remote))
+        .map(IndexPath::new)
+}
+
 pub struct VcsPage {
     commit_state: Entity<ListState<CommitListDelegate>>,
     /// 项目下拉框，和启动页共用一份实现；选中项写回设置，两个页面自然同步。
     project_select: ProjectSelect,
     /// 保活项目下拉框的事件订阅。
     _select_subscription: Subscription,
+    /// 远程仓库下拉框，选项是当前项目的 git remote。
+    remote_select: Entity<SelectState<Vec<String>>>,
+    /// 保活远程下拉框的事件订阅。
+    _remote_subscription: Subscription,
+    /// 当前选中的远程名，拉取和推送都作用在它上面。
+    selected_remote: Option<String>,
+    /// 远程列表的请求号：换项目后，早先那次读远程的结果就作废了。
+    remotes_request_id: u64,
     revset: String,
     revset_input: Entity<InputState>,
     _revset_subscription: Subscription,
     history_request_id: u64,
-    checkout_in_progress: bool,
+    /// 正在跑的仓库操作，没有就是 `None`。
+    operation: Option<VcsOperation>,
 }
 
 impl VcsPage {
@@ -622,7 +673,27 @@ impl VcsPage {
                     return;
                 }
 
+                // 换了项目，远程仓库和历史都得重新读。
+                page.reload_remotes(window, cx);
                 page.reload_history(window, cx);
+                cx.notify();
+            },
+        );
+
+        // 远程下拉框一开始是空的，等 `reload_remotes` 后台读完再填。
+        let remote_select = cx.new(|cx| SelectState::new(Vec::new(), None, window, cx));
+        let remote_subscription = cx.subscribe_in(
+            &remote_select,
+            window,
+            |page: &mut Self, _state, event: &SelectEvent<Vec<String>>, _window, cx| {
+                let SelectEvent::Confirm(Some(remote)) = event else {
+                    return;
+                };
+                if page.selected_remote.as_ref() == Some(remote) {
+                    return;
+                }
+
+                page.selected_remote = Some(remote.clone());
                 cx.notify();
             },
         );
@@ -651,12 +722,17 @@ impl VcsPage {
             commit_state,
             project_select,
             _select_subscription: select_subscription,
+            remote_select,
+            _remote_subscription: remote_subscription,
+            selected_remote: None,
+            remotes_request_id: 0,
             revset,
             revset_input,
             _revset_subscription: revset_subscription,
             history_request_id: 0,
-            checkout_in_progress: false,
+            operation: None,
         };
+        page.reload_remotes(window, cx);
         page.reload_history(window, cx);
         page
     }
@@ -698,17 +774,60 @@ impl VcsPage {
         .detach();
     }
 
+    /// 后台读当前项目的 git remote 列表，填进下拉框。
+    ///
+    /// 换项目、点刷新，或者进页面时都会走一遍。
+    fn reload_remotes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.remotes_request_id = self.remotes_request_id.wrapping_add(1);
+        let request_id = self.remotes_request_id;
+        let Some(path) = self.project_select.selected_path().cloned() else {
+            self.set_remotes(Vec::new(), window, cx);
+            return;
+        };
+
+        let page = cx.entity().downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { jj::load_remotes(path) })
+                .await;
+            let _ = page.update_in(cx, |page, window, cx| {
+                if page.remotes_request_id != request_id {
+                    return;
+                }
+                // 读不到就当没有远程仓库：是不是 jj 仓库、仓库坏没坏，历史列表那边
+                // 已经会给出提示，这里再弹一次只是重复。
+                let remotes = result.unwrap_or_default();
+                page.set_remotes(remotes, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 把读回来的远程列表写进下拉框，尽量保留原来的选择。
+    fn set_remotes(&mut self, remotes: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let selected = resolve_remote(&remotes, self.selected_remote.clone());
+        self.selected_remote = selected.clone();
+
+        let index = remote_index(&remotes, selected.as_ref());
+        self.remote_select.update(cx, |state, cx| {
+            state.set_items(remotes, window, cx);
+            state.set_selected_index(index, window, cx);
+        });
+    }
+
     /// 让下拉框跟上设置：设置页/启动页可能换过当前项目，也可能增删过版本目录。
     ///
     /// 选中的项目变了才重新读历史，只是选项列表变了不用重读。
     fn sync_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.project_select.sync(window, cx) {
+            self.reload_remotes(window, cx);
             self.reload_history(window, cx);
         }
     }
 
     fn checkout_commit(&mut self, commit_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.checkout_in_progress {
+        if self.operation.is_some() {
             return;
         }
 
@@ -720,7 +839,7 @@ impl VcsPage {
             return;
         };
 
-        self.checkout_in_progress = true;
+        self.operation = Some(VcsOperation::Checkout);
         self.history_request_id = self.history_request_id.wrapping_add(1);
         let request_id = self.history_request_id;
         self.commit_state.update(cx, |state, cx| {
@@ -745,7 +864,7 @@ impl VcsPage {
                 .await;
 
             let _ = page.update_in(cx, |page, window, cx| {
-                page.checkout_in_progress = false;
+                page.operation = None;
                 page.commit_state.update(cx, |state, cx| {
                     state.delegate_mut().set_disabled(false);
                     cx.notify();
@@ -790,7 +909,7 @@ impl VcsPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.checkout_in_progress {
+        if self.operation.is_some() {
             return;
         }
 
@@ -802,7 +921,7 @@ impl VcsPage {
             return;
         };
 
-        self.checkout_in_progress = true;
+        self.operation = Some(VcsOperation::MoveBookmark);
         self.history_request_id = self.history_request_id.wrapping_add(1);
         let request_id = self.history_request_id;
         self.commit_state.update(cx, |state, cx| {
@@ -826,7 +945,7 @@ impl VcsPage {
                 .await;
 
             let _ = page.update_in(cx, |page, window, cx| {
-                page.checkout_in_progress = false;
+                page.operation = None;
                 page.commit_state.update(cx, |state, cx| {
                     state.delegate_mut().set_disabled(false);
                     cx.notify();
@@ -852,6 +971,177 @@ impl VcsPage {
                             cx,
                         );
                     }
+                    Err(error) => {
+                        window.push_notification((NotificationType::Error, error), cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 拉取当前远程：把远程上的 bookmark 拉下来，再重读一遍历史。
+    fn fetch_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_remote_command(RemoteCommand::Fetch, window, cx);
+    }
+
+    /// 推送所有本地 bookmark 到当前远程。
+    ///
+    /// 这一步会动远程仓库，所以先弹一个确认框；真正执行的是 [`Self::push_remote_now`]。
+    fn open_push_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.operation.is_some() || window.has_active_dialog(cx) {
+            return;
+        }
+
+        if self.project_select.selected_path().is_none() {
+            window.push_notification(
+                (NotificationType::Error, "当前没有选中的整合包".to_owned()),
+                cx,
+            );
+            return;
+        }
+        let Some(remote) = self.selected_remote.clone() else {
+            window.push_notification(
+                (
+                    NotificationType::Error,
+                    "请先选择要推送的远程仓库".to_owned(),
+                ),
+                cx,
+            );
+            return;
+        };
+        // 弹窗里点名是哪个整合包，免得用户在几个项目之间点错了还看不出来。
+        let project = self
+            .project_select
+            .selected_project()
+            .map(|project| project.name.clone())
+            .unwrap_or_else(|| "当前整合包".to_owned());
+
+        let page = cx.entity().downgrade();
+        let confirm_remote = remote.clone();
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let page = page.clone();
+            let remote = confirm_remote.clone();
+            dialog
+                .title("确认推送")
+                .overlay_closable(true)
+                .footer(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("push-cancel")
+                                .label("取消")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(Button::new("push-confirm").label("推送").on_click(
+                            move |_, window, cx| {
+                                window.close_dialog(cx);
+                                let _ =
+                                    page.update(cx, |page, cx| page.push_remote_now(window, cx));
+                            },
+                        )),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_2()
+                        .child(Label::new(format!(
+                            "将把「{project}」的所有本地 bookmark 推送到远程 {remote}。"
+                        )))
+                        .child(
+                            Label::new(format!(
+                                "会把「{project}」的所有本地 bookmark 推到远程 {remote}：远程上不存在的 \
+                                 会被新建，已存在的会被更新。推送前会先跟远程对账，远程那边已经动过就拒绝，\
+                                 不会盖掉别人的提交。"
+                            ))
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground),
+                        ),
+                )
+        });
+    }
+
+    /// 确认推送后真正执行，和拉取共用一条流程。
+    fn push_remote_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_remote_command(RemoteCommand::Push, window, cx);
+    }
+
+    /// 拉取/推送共用的一条流程：锁住页面、后台跑 jj、回来后重读历史。
+    ///
+    /// 两个操作都会改动远程上的 bookmark，历史列表里的远程标签要重读才是最新的。
+    fn run_remote_command(
+        &mut self,
+        command: RemoteCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.operation.is_some() {
+            return;
+        }
+
+        let Some(path) = self.project_select.selected_path().cloned() else {
+            window.push_notification(
+                (NotificationType::Error, "当前没有选中的整合包".to_owned()),
+                cx,
+            );
+            return;
+        };
+        let Some(remote) = self.selected_remote.clone() else {
+            window.push_notification((NotificationType::Error, "请先选择远程仓库".to_owned()), cx);
+            return;
+        };
+
+        self.operation = Some(VcsOperation::Remote(command));
+        // 还在飞的那次「读历史」已经过期，别让它把新状态覆盖回去。
+        self.history_request_id = self.history_request_id.wrapping_add(1);
+        let request_id = self.history_request_id;
+        self.commit_state.update(cx, |state, cx| {
+            state.delegate_mut().set_disabled(true);
+            cx.notify();
+        });
+
+        let revset = self.revset.clone();
+        let page = cx.entity().downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            // 显式写出返回类型：成功分支带摘要、失败分支带错误文案，靠推断定不下来。
+            let result: Result<(jj::CommitHistory, String), String> = cx
+                .background_executor()
+                .spawn(async move {
+                    let summary = match command {
+                        RemoteCommand::Fetch => jj::fetch_remote(&path, &remote),
+                        RemoteCommand::Push => jj::push_remote(&path, &remote),
+                    }
+                    .map_err(|error| format!("{}失败：{error}", command.label()))?;
+                    let history = jj::load_history(&path, &revset)
+                        .map_err(|error| format!("读取提交历史失败：{error}"))?;
+
+                    Ok((history, summary))
+                })
+                .await;
+
+            let _ = page.update_in(cx, |page, window, cx| {
+                page.operation = None;
+                page.commit_state.update(cx, |state, cx| {
+                    state.delegate_mut().set_disabled(false);
+                    cx.notify();
+                });
+                if page.history_request_id != request_id {
+                    return;
+                }
+
+                match result {
+                    Ok((history, summary)) => {
+                        page.commit_state.update(cx, |state, cx| {
+                            state.delegate_mut().set_history_result(Ok(history));
+                            cx.notify();
+                        });
+                        // 摘要自己会说明推了什么（也可能是什么都没推），直接当通知正文。
+                        window.push_notification((NotificationType::Success, summary), cx);
+                    }
+                    // 拉取/推送失败（比如没配凭据）时历史本身还是好的，
+                    // 列表留着不动，只把失败原因说出来。
                     Err(error) => {
                         window.push_notification((NotificationType::Error, error), cx);
                     }
@@ -888,11 +1178,55 @@ impl Render for VcsPage {
                         Button::new("refresh-vcs")
                             .icon(gpui_kit::component::IconName::RotateCw)
                             .label("刷新")
+                            .disabled(self.operation.is_some())
                             .on_click(cx.listener(|this, _, window, cx| {
-                                // 先把下拉框和设置对齐，再按当前项目重读历史。
+                                // 先把下拉框和设置对齐，再按当前项目重读远程和历史。
                                 this.project_select.sync(window, cx);
+                                this.reload_remotes(window, cx);
                                 this.reload_history(window, cx);
                             })),
+                    ),
+            )
+            .child(
+                // 远程操作工具栏：远程仓库下拉框 + 拉取 + 推送。
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .child(Label::new("远程仓库"))
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Select::new(&self.remote_select)
+                                .h(px(32.))
+                                .disabled(self.operation.is_some())
+                                .placeholder("选择远程仓库"),
+                        ),
+                    )
+                    .child(
+                        Button::new("fetch-remote")
+                            .icon(gpui_kit::component::IconName::ArrowDown)
+                            .label("拉取")
+                            .disabled(self.operation.is_some() || self.selected_remote.is_none())
+                            .loading(
+                                self.operation == Some(VcsOperation::Remote(RemoteCommand::Fetch)),
+                            )
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.fetch_remote(window, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("push-remote")
+                            .icon(gpui_kit::component::IconName::ArrowUp)
+                            .label("推送")
+                            .disabled(self.operation.is_some() || self.selected_remote.is_none())
+                            .loading(
+                                self.operation == Some(VcsOperation::Remote(RemoteCommand::Push)),
+                            )
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.open_push_dialog(window, cx)
+                                }),
+                            ),
                     ),
             )
             .child(
@@ -1016,5 +1350,37 @@ mod tests {
         let ids = vec!["abc".to_owned(), "abc".to_owned()];
 
         assert_eq!(unique_prefix_lengths(&ids), vec![3, 3]);
+    }
+
+    #[test]
+    fn resolve_remote_keeps_the_previous_choice_and_falls_back_to_the_first() {
+        let remotes = vec!["origin".to_owned(), "upstream".to_owned()];
+
+        // 原来选中的还在，就还是它。
+        assert_eq!(
+            resolve_remote(&remotes, Some("upstream".to_owned())),
+            Some("upstream".to_owned())
+        );
+        // 选中的远程没了（比如换了项目），退回第一个。
+        assert_eq!(
+            resolve_remote(&remotes, Some("gone".to_owned())),
+            Some("origin".to_owned())
+        );
+        // 还没选过。
+        assert_eq!(resolve_remote(&remotes, None), Some("origin".to_owned()));
+        // 一个远程都没有。
+        assert_eq!(resolve_remote(&[], Some("origin".to_owned())), None);
+    }
+
+    #[test]
+    fn remote_index_matches_the_remote_name() {
+        let remotes = vec!["origin".to_owned(), "upstream".to_owned()];
+
+        assert_eq!(
+            remote_index(&remotes, Some(&"upstream".to_owned())),
+            Some(IndexPath::new(1))
+        );
+        assert_eq!(remote_index(&remotes, Some(&"gone".to_owned())), None);
+        assert_eq!(remote_index(&remotes, None), None);
     }
 }
