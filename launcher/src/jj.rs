@@ -147,8 +147,8 @@ fn default_ignores(path: &Path) -> Vec<String> {
     .collect::<Vec<_>>();
 
     if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-        entries.push(format!("{name}.jar"));
-        entries.push(format!("{name}.json"));
+        entries.push(format!("/{name}.jar"));
+        entries.push(format!("/{name}.json"));
     }
 
     entries
