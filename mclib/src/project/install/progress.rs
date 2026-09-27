@@ -381,13 +381,11 @@ impl InstallProgress {
         java: Option<JavaVersion>,
     ) -> Result<(), crate::error::Error> {
         let folder = std::path::absolute(folder)?;
-        let project = crate::project::game_project::get_game_project(&folder)?;
-        // 版本文件按文件夹名命名（<name>.jar / <name>.json），以文件夹名为准。
-        let name = folder
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .ok_or_else(|| failed(format!("无效的项目文件夹：{}", folder.display())))?
-            .to_string();
+        // 读项目信息，并把 project.json 里记的名字/路径纠正成本地文件夹的：
+        // 从别处拷来的元数据记的是原机器的项目名和安装路径，不纠正的话
+        // 克隆下来的项目按 `path` 识别时永远对不上。
+        let project = crate::project::game_project::get_local_game_project(&folder)?;
+        let name = project.name.clone();
         let game_version = project.game_version.clone();
         let loader_version = project.loader_version.clone();
 

@@ -94,6 +94,30 @@ pub fn get_game_project(path_buf: &PathBuf) -> Result<GameProject, crate::error:
     read_from_json_file(path_buf)
 }
 
+/// 读取文件夹里的项目信息，并把名字/路径纠正成本文件夹的。
+///
+/// 从别的机器拷来（或 git 克隆）的 `.rev_launcher/project.json` 里记的是
+/// 原机器上的项目名和安装路径，而启动器各页面都按 `path` 识别项目，
+/// 这份过期的元数据会让克隆下来的项目永远对不上。这里读出游戏版本和
+/// 加载器等信息后，把名字和路径换成本文件夹的再写回 `project.json`。
+pub fn get_local_game_project(path_buf: &PathBuf) -> Result<GameProject, crate::error::Error> {
+    let name = path_buf
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(crate::error::Error::UnknownPath)?;
+    let project = get_game_project(path_buf)?;
+    let corrected = GameProject {
+        name: name.to_owned(),
+        version: project.version,
+        path: path_buf.clone(),
+        game_version: project.game_version,
+        loader: project.loader,
+        loader_version: project.loader_version,
+    };
+    corrected.save()?;
+    Ok(corrected)
+}
+
 /// 尝试从启动器的版本文件中读取
 fn read_from_project_file(path_buf: &PathBuf) -> Result<GameProject, crate::error::Error> {
     GameProject::load(path_buf)
@@ -200,4 +224,46 @@ fn read_from_json_file(path_buf: &PathBuf) -> Result<GameProject, crate::error::
     }
 
     Err(crate::error::Error::UnknownPath)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// project.json 里记着别的机器的名字和路径时，读取会把它们纠正成
+    /// 本文件夹的，并写回元数据文件；否则 git 克隆下来的项目按 path
+    /// 识别时永远对不上。
+    #[test]
+    fn get_local_game_project_fixes_stale_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("MyPack");
+        let meta = folder.join(".rev_launcher");
+        std::fs::create_dir_all(&meta).unwrap();
+        let stale = GameProject {
+            name: "1.20.1".to_owned(),
+            version: String::new(),
+            path: PathBuf::from(r"D:\modpack\1.20.1"),
+            game_version: "1.20.1".to_owned(),
+            loader: ModLoader::Forge,
+            loader_version: "47.4.23".to_owned(),
+        };
+        // 直接把过期的元数据写进测试文件夹（save 会按 stale.path 写去别处）。
+        std::fs::write(
+            meta.join("project.json"),
+            serde_json::to_string_pretty(&stale).unwrap(),
+        )
+        .unwrap();
+
+        let project = get_local_game_project(&folder).unwrap();
+        assert_eq!(project.name, "MyPack");
+        assert_eq!(project.path, folder);
+        assert_eq!(project.game_version, "1.20.1");
+        assert_eq!(project.loader, ModLoader::Forge);
+        assert_eq!(project.loader_version, "47.4.23");
+
+        // 写回的元数据也是纠正过的，后续识别读到的就是本机路径。
+        let reloaded = GameProject::load(&folder).unwrap();
+        assert_eq!(reloaded.name, "MyPack");
+        assert_eq!(reloaded.path, folder);
+    }
 }

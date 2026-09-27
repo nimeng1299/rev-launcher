@@ -2050,4 +2050,26 @@ mod tests {
             .expect_err("non-empty dest");
         assert!(error.to_string().contains("目标目录"), "{error}");
     }
+
+    /// 端到端：克隆真实仓库后项目信息要把元数据里的名字/路径纠正成
+    /// 本地文件夹的（mptest 仓库的 project.json 记的是打包者的机器）。
+    #[test]
+    fn clone_mptest_and_normalize_project() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dest = temp.path().join("mptest");
+        clone("https://github.com/nimeng1299/mptest.git", &dest).expect("clone");
+
+        let project = mclib::project::game_project::get_local_game_project(&dest.to_path_buf())
+            .expect("project should be recognized");
+        assert_eq!(project.name, "mptest");
+        assert_eq!(project.path, dest);
+        assert_eq!(project.loader, mclib::project::game_project::ModLoader::Forge);
+        assert_eq!(project.game_version, "1.20.1");
+
+        // 写回的元数据是本机的，再识别一次结果一致。
+        let reloaded =
+            mclib::project::game_project::get_game_project(&dest.to_path_buf()).expect("reload");
+        assert_eq!(reloaded.name, "mptest");
+        assert_eq!(reloaded.path, dest);
+    }
 }
