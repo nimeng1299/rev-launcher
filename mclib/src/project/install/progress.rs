@@ -15,7 +15,7 @@ use crate::java::java_version::JavaVersion;
 use crate::launch::arguments::{
     RuleContext, library_path, maven_path, relative_path, rules_allow,
 };
-use crate::project::game_project::GameProject;
+use crate::project::game_project::{GameProject, ModLoader};
 use crate::project::versions;
 
 /// 名称形式的 Forge 支持库默认按顺序尝试的 Maven 仓库。
@@ -52,6 +52,40 @@ impl InstallProgress {
             assets_downloader: Arc::new(OnceLock::new()),
             asset_names: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// 从已有的项目文件夹读取项目并安装。
+    ///
+    /// path: 项目文件夹（其中应有 `<文件夹名>.json` 版本清单或
+    /// `.rev_launcher/project.json`，安装直接在该文件夹中进行，
+    /// 失败时不会删除它）；libraries_path: 支持库目录（Forge 需要，
+    /// 应使用与启动时一致的 `settings.libraries_path`）；
+    /// assets_path: 资源文件目录（应使用 `settings.assets_path`）；
+    /// java: 运行 Forge 安装处理器的 Java，原版安装可传 `None`。
+    ///
+    /// 根据读取到的加载器执行对应的安装流程：原版安装客户端 jar 和
+    /// 资源文件；Forge 还会下载安装器、支持库并执行 processors。
+    /// Neoforge 和 Fabric 暂不支持，会直接失败。
+    pub fn install_form_folder<P: AsRef<Path>>(
+        path: P,
+        libraries_path: P,
+        assets_path: P,
+        java: Option<JavaVersion>,
+    ) -> Self {
+        let progress = Self::new();
+        let path = path.as_ref().to_path_buf();
+        let libraries_path = libraries_path.as_ref().to_path_buf();
+        let assets_path = assets_path.as_ref().to_path_buf();
+
+        let handle = progress.clone();
+        std::thread::spawn(move || {
+            if let Err(error) = handle.run_folder(&path, &libraries_path, &assets_path, java) {
+                // 文件夹是用户提供的，失败时只记录错误，不做清理。
+                handle.set_error(error);
+            }
+        });
+
+        progress
     }
 
     /// 安装原版
@@ -329,6 +363,71 @@ impl InstallProgress {
         let _ = self.success.set(project);
         self.state.store(InstallState::Success, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// 文件夹安装流程：读取项目信息（优先 `.rev_launcher/project.json`，
+    /// 其次 `<文件夹名>.json`），按加载器分发到对应的安装流程。
+    fn run_folder(
+        &self,
+        folder: &Path,
+        libraries_path: &Path,
+        assets_path: &Path,
+        java: Option<JavaVersion>,
+    ) -> Result<(), crate::error::Error> {
+        let folder = std::path::absolute(folder)?;
+        let project = crate::project::game_project::get_game_project(&folder)?;
+        // 版本文件按文件夹名命名（<name>.jar / <name>.json），以文件夹名为准。
+        let name = folder
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| failed(format!("无效的项目文件夹：{}", folder.display())))?
+            .to_string();
+        let parent = folder
+            .parent()
+            .ok_or_else(|| failed(format!("项目文件夹 {} 缺少父目录", folder.display())))?
+            .to_path_buf();
+        let game_version = project.game_version.clone();
+        let loader_version = project.loader_version.clone();
+
+        match project.loader {
+            ModLoader::Minecraft => {
+                // 在官方版本清单里按游戏版本找到清单下载地址。
+                let manifest = versions::minecreft::MinecreftVersions::get_versions()?;
+                let url = manifest
+                    .versions
+                    .iter()
+                    .find(|entry| entry.id == game_version)
+                    .map(|entry| entry.url.clone())
+                    .ok_or_else(|| {
+                        failed(format!("找不到 Minecraft {game_version} 的版本清单"))
+                    })?;
+                self.run_minecraft(&name, &parent, assets_path, &url)
+            }
+            ModLoader::Forge => {
+                // 在 Forge 版本列表里按加载器版本找到安装器信息。
+                let java = java.ok_or_else(|| failed("安装 Forge 需要 Java 环境"))?;
+                let forge_list =
+                    versions::forge::ForgeVersions::get_versions(game_version.clone())?;
+                let version = forge_list
+                    .versions
+                    .into_iter()
+                    .find(|entry| entry.version == loader_version)
+                    .ok_or_else(|| {
+                        failed(format!(
+                            "找不到 Minecraft {game_version} 对应的 Forge {loader_version}"
+                        ))
+                    })?;
+                self.run_forge(
+                    &name,
+                    &parent,
+                    libraries_path,
+                    assets_path,
+                    &java,
+                    &version,
+                )
+            }
+            loader => Err(failed(format!("暂不支持从文件夹安装 {loader:?} 项目"))),
+        }
     }
 }
 

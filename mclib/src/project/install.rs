@@ -1,17 +1,25 @@
 pub mod progress;
 
-use std::path::{Path, PathBuf};
-use crate::error::Error;
+use std::path::Path;
 use crate::java::java_version::JavaVersion;
-use crate::project::game_project::GameProject;
 use crate::project::install::progress::InstallProgress;
 use crate::project::versions;
 
-pub fn install_git_project(_path_buf: PathBuf) -> Result<GameProject, Error>{
-    todo!("install_git_project");
-
-
-    //Err(Error::UnknownError)
+/// 从已有的项目文件夹读取项目并按加载器安装：原版安装客户端 jar
+/// 和资源文件；Forge 还会下载安装器、支持库并执行 processors。
+///
+/// path: 项目文件夹（其中应有 `<文件夹名>.json` 版本清单或
+/// `.rev_launcher/project.json`）；libraries_path: 支持库目录
+/// （应使用 `settings.libraries_path`）；assets_path: 资源文件目录
+/// （应使用 `settings.assets_path`）；java: 运行 Forge 安装处理器
+/// 的 Java，原版安装可传 `None`。
+pub fn install_form_folder<P: AsRef<Path>>(
+    path: P,
+    libraries_path: P,
+    assets_path: P,
+    java: Option<JavaVersion>,
+) -> InstallProgress {
+    InstallProgress::install_form_folder(path, libraries_path, assets_path, java)
 }
 
 /// 安装原版
