@@ -2,8 +2,10 @@
 //!
 //! 「从 Git 安装」先用 [`crate::jj::clone`] 把仓库克隆成项目目录，
 //! 再接着调 `InstallProgress::install_form_folder`：按克隆下来的版本
-//! JSON 里的加载器走对应的安装流程。拖入的整合包文件目前只记录在
-//! 界面上，安装功能还没有实现。
+//! JSON 里的加载器走对应的安装流程。安装完成后是最后一步：读
+//! `.rev_launcher/` 里的记录，反序列化（下载）模组、资源包和光影
+//! ——仓库里通常只提交这些 toml 记录，实际文件被 gitignore 挡住了。
+//! 拖入的整合包文件目前只记录在界面上，安装功能还没有实现。
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -21,9 +23,11 @@ use gpui_kit::{
     ParentElement, Render, Styled, Window, div, px,
 };
 
-use mclib::project::game_project::{ModLoader, get_game_project};
+use mclib::detective::base::{ResourceKind, deserialize_resources};
+use mclib::project::game_project::{GameProject, ModLoader, get_game_project};
 use mclib::project::install::install_form_folder;
 use mclib::project::install::progress::{InstallProgress, InstallState};
+use sharingan::downloader::Downloader;
 
 use crate::data::app_data::ProjectsRevision;
 use crate::data::settings::AppSettings;
@@ -206,18 +210,63 @@ struct GitInstallDialog {
     progress: Option<InstallProgress>,
     /// 安装失败信息。
     error: Arc<Mutex<Option<String>>>,
-    /// 安装成功后创建出来的项目名，结果页展示用。
-    installed_name: Option<String>,
+    /// 安装成功后创建出来的项目，反序列化阶段和结果页都要用它。
+    installed_project: Option<GameProject>,
+    /// 反序列化阶段的后台状态；`None` 表示还没开始。
+    deserialize: Arc<Mutex<Option<DeserializeState>>>,
     /// 克隆目标目录；点开始后才有。
     dest: Option<PathBuf>,
     focus_handle: FocusHandle,
 }
 
-/// 对话框所处阶段：表单 → 克隆中 → 安装中（安装的细节看 `status`）。
+/// 对话框所处阶段：表单 → 克隆中 → 安装中（细节看 `status`）→
+/// 反序列化资源（细节看 `deserialize`）→ 结束。
 enum Phase {
     Form,
     Cloning,
     Installing,
+    Deserializing,
+    Done,
+    Failed,
+}
+
+/// 反序列化阶段后台线程与界面之间共享的状态。
+#[derive(Clone)]
+enum DeserializeState {
+    /// 正在下载某一类资源。
+    Running {
+        kind: ResourceKind,
+        downloader: Arc<Downloader>,
+    },
+    /// 三类都处理完了（中间跳过的也算处理完）。
+    Done,
+    /// 读记录或下载失败，带上原因。
+    Failed(String),
+}
+
+/// 反序列化时每类资源的下载线程数。
+const DESERIALIZE_THREADS: usize = 10;
+
+/// 资源类别的中文名，进度展示用。
+fn kind_label(kind: ResourceKind) -> &'static str {
+    match kind {
+        ResourceKind::Mod => "模组",
+        ResourceKind::ResourcePack => "资源包",
+        ResourceKind::Shader => "光影",
+    }
+}
+
+/// 汇总下载器里失败的任务，格式和安装阶段的下载失败信息一致。
+fn download_failures(downloader: &Downloader) -> Vec<String> {
+    downloader
+        .tasks()
+        .values()
+        .filter(|task| !task.status().is_success())
+        .map(|task| {
+            let reason = task.failed_reason();
+            format!("{}（{reason:?}）", task.filename())
+        })
+        .collect()
 }
 
 impl GitInstallDialog {
@@ -239,7 +288,8 @@ impl GitInstallDialog {
             status: Arc::new(Mutex::new(None)),
             progress: None,
             error: Arc::new(Mutex::new(None)),
-            installed_name: None,
+            installed_project: None,
+            deserialize: Arc::new(Mutex::new(None)),
             dest: None,
             focus_handle: cx.focus_handle(),
         }
@@ -310,22 +360,14 @@ impl GitInstallDialog {
     }
 
     fn is_running(&self) -> bool {
-        match self.phase {
-            Phase::Cloning => true,
-            Phase::Installing => self
-                .status
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_some_and(|status| matches!(status, InstallStatus::Running(_))),
-            Phase::Form => false,
-        }
+        matches!(
+            self.phase,
+            Phase::Cloning | Phase::Installing | Phase::Deserializing
+        )
     }
 
     fn is_finished(&self) -> bool {
-        self.status
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some_and(|status| matches!(status, InstallStatus::Done | InstallStatus::Failed(_)))
+        matches!(self.phase, Phase::Done | Phase::Failed)
     }
 
     /// 点「克隆并安装」：校验表单，克隆仓库，成功后接着安装。
@@ -433,7 +475,8 @@ impl GitInstallDialog {
         window.push_notification((NotificationType::Info, summary), cx);
         cx.notify();
 
-        // 轮询安装状态：映射到步骤下标并刷新界面，结束后写入结果。
+        // 轮询安装状态：映射到步骤下标并刷新界面；安装成功后接着反序列化
+        // 模组/资源包/光影，全部结束才收尾。
         cx.spawn_in(window, async move |view, cx| {
             loop {
                 cx.background_executor()
@@ -441,45 +484,69 @@ impl GitInstallDialog {
                     .await;
                 let keep_polling = view
                     .update_in(cx, |dialog, _window, cx| {
-                        let state = progress.state();
-                        match state {
-                            InstallState::Success => {
-                                *dialog.status.lock().unwrap_or_else(|e| e.into_inner()) =
-                                    Some(InstallStatus::Done);
-                                if let Some(project) = progress.success() {
-                                    dialog.installed_name = Some(project.name);
+                        match dialog.phase {
+                            Phase::Installing => match progress.state() {
+                                InstallState::Success => {
+                                    if let Some(project) = progress.success() {
+                                        dialog.installed_project = Some(project);
+                                    }
+                                    // 磁盘上多了一个项目，让启动页/VCS 页/版本管理页重扫。
+                                    cx.global_mut::<ProjectsRevision>().bump();
+                                    dialog.start_deserialize(cx);
                                 }
-                                // 磁盘上多了一个项目，让启动页/VCS 页/版本管理页重扫。
-                                cx.global_mut::<ProjectsRevision>().bump();
-                                cx.notify();
-                                return false;
-                            }
-                            InstallState::Failed => {
-                                // 标记当前进行中的步骤为失败。
-                                let step = match *dialog
-                                    .status
+                                InstallState::Failed => {
+                                    // 标记当前进行中的步骤为失败。
+                                    let step = match *dialog
+                                        .status
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                    {
+                                        Some(InstallStatus::Running(step)) => step,
+                                        _ => dialog.steps.len() - 1,
+                                    };
+                                    if let Some(error) = progress.error() {
+                                        *dialog.error.lock().unwrap_or_else(|e| e.into_inner()) =
+                                            Some(error.to_string());
+                                    }
+                                    *dialog.status.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        Some(InstallStatus::Failed(step));
+                                    dialog.phase = Phase::Failed;
+                                    cx.notify();
+                                    return false;
+                                }
+                                state => {
+                                    *dialog.status.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        Some(InstallStatus::Running(step_index(
+                                            state,
+                                            dialog.is_forge,
+                                        )));
+                                }
+                            },
+                            Phase::Deserializing => {
+                                let state = dialog
+                                    .deserialize
                                     .lock()
                                     .unwrap_or_else(|e| e.into_inner())
-                                {
-                                    Some(InstallStatus::Running(step)) => step,
-                                    _ => dialog.steps.len() - 1,
-                                };
-                                if let Some(error) = progress.error() {
-                                    *dialog.error.lock().unwrap_or_else(|e| e.into_inner()) =
-                                        Some(error.to_string());
+                                    .clone();
+                                match state {
+                                    Some(DeserializeState::Done) => {
+                                        dialog.phase = Phase::Done;
+                                        cx.notify();
+                                        return false;
+                                    }
+                                    Some(DeserializeState::Failed(error)) => {
+                                        *dialog.error.lock().unwrap_or_else(|e| e.into_inner()) =
+                                            Some(error);
+                                        dialog.phase = Phase::Failed;
+                                        cx.notify();
+                                        return false;
+                                    }
+                                    // Running（或第一类还没就位）：界面自己读共享状态渲染。
+                                    _ => {}
                                 }
-                                *dialog.status.lock().unwrap_or_else(|e| e.into_inner()) =
-                                    Some(InstallStatus::Failed(step));
-                                cx.notify();
-                                return false;
                             }
-                            state => {
-                                *dialog.status.lock().unwrap_or_else(|e| e.into_inner()) =
-                                    Some(InstallStatus::Running(step_index(
-                                        state,
-                                        dialog.is_forge,
-                                    )));
-                            }
+                            // 其余阶段要么还没开始要么已结束，不该出现在轮询里。
+                            _ => return false,
                         }
                         cx.notify();
                         true
@@ -491,6 +558,70 @@ impl GitInstallDialog {
             }
         })
         .detach();
+    }
+
+    /// 安装成功后进入反序列化阶段：按模组/资源包/光影的顺序读
+    /// `.rev_launcher/` 下的记录并下载缺失的资源文件。某一类没有记录
+    /// 就跳过，三类都为空时这个阶段一闪而过直接收尾。
+    ///
+    /// 实际工作在独立线程里顺序执行，界面通过 `deserialize` 共享状态
+    /// 观察进度（当前类别 + 下载器）和结果。
+    fn start_deserialize(&mut self, cx: &mut Context<Self>) {
+        let project = self.installed_project.clone().expect("安装成功后才调用");
+        self.phase = Phase::Deserializing;
+        cx.notify();
+
+        let state = self.deserialize.clone();
+        std::thread::spawn(move || {
+            for kind in [
+                ResourceKind::Mod,
+                ResourceKind::ResourcePack,
+                ResourceKind::Shader,
+            ] {
+                // 没有记录目录就直接跳过，免得反序列化凭空建出空的资源目录。
+                let meta_dir = project.path.join(".rev_launcher").join(kind.dir_name());
+                if !meta_dir.is_dir() {
+                    continue;
+                }
+                let downloader =
+                    match deserialize_resources(&project, kind, DESERIALIZE_THREADS) {
+                        Ok(downloader) => downloader,
+                        Err(error) => {
+                            *state.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(DeserializeState::Failed(format!(
+                                    "读取{}记录失败：{error}",
+                                    kind_label(kind)
+                                )));
+                            return;
+                        }
+                    };
+                // 这一类没有记录（目录不存在或没有 toml）就没有任务，直接跳过。
+                if downloader.tasks().is_empty() {
+                    continue;
+                }
+                let downloader = Arc::new(downloader);
+                *state.lock().unwrap_or_else(|e| e.into_inner()) = Some(DeserializeState::Running {
+                    kind,
+                    downloader: downloader.clone(),
+                });
+
+                // 等这一类下载结束（Downloader 没有阻塞等待接口，轮询即可）。
+                while !downloader.is_finished() {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                let failures = download_failures(&downloader);
+                if !failures.is_empty() {
+                    *state.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(DeserializeState::Failed(format!(
+                            "{}下载失败：{}",
+                            kind_label(kind),
+                            failures.join(", ")
+                        )));
+                    return;
+                }
+            }
+            *state.lock().unwrap_or_else(|e| e.into_inner()) = Some(DeserializeState::Done);
+        });
     }
 }
 
@@ -571,13 +702,10 @@ impl Render for GitInstallDialog {
                             ),
                     );
             }
-            // 安装阶段：克隆一步已完成，后面是和下载弹窗一样的步骤列表。
-            Phase::Installing => {
-                let status = self
-                    .status
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .unwrap_or(InstallStatus::Running(0));
+            // 安装/反序列化/结束阶段：克隆一步已完成，后面是和下载弹窗
+            // 一样的安装步骤列表，末尾再跟一个反序列化步骤。
+            Phase::Installing | Phase::Deserializing | Phase::Done | Phase::Failed => {
+                let install_status = *self.status.lock().unwrap_or_else(|e| e.into_inner());
                 let error = self.error.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let asset_names = self
                     .progress
@@ -585,7 +713,17 @@ impl Render for GitInstallDialog {
                     .and_then(InstallProgress::asset_names);
                 content = content.child(step_marker(0, "克隆仓库", StepStatus::Complete, cx));
                 for index in 0..self.steps.len() {
-                    let step = step_status(index, status);
+                    let step = match (&self.phase, install_status) {
+                        (Phase::Installing, status) => {
+                            step_status(index, status.unwrap_or(InstallStatus::Running(0)))
+                        }
+                        // 安装阶段失败：按记录把失败的步骤标出来。
+                        (Phase::Failed, Some(status @ InstallStatus::Failed(_))) => {
+                            step_status(index, status)
+                        }
+                        // 其余情况（反序列化中/全部完成/反序列化失败）安装都已成功。
+                        _ => StepStatus::Complete,
+                    };
                     content = content.child(step_marker(index + 1, self.steps[index], step, cx));
                     let downloader =
                         step_downloader(self.progress.as_ref(), self.is_forge, index);
@@ -618,12 +756,67 @@ impl Render for GitInstallDialog {
                         );
                     }
                 }
-                if status == InstallStatus::Done {
+
+                // 反序列化步骤：安装成功后才有意义，失败发生在安装阶段时不展示。
+                let install_failed = matches!(install_status, Some(InstallStatus::Failed(_)));
+                let deserialize_step = match self.phase {
+                    Phase::Deserializing => StepStatus::Active,
+                    Phase::Done => StepStatus::Complete,
+                    Phase::Failed if !install_failed => StepStatus::Failed,
+                    _ => StepStatus::Pending,
+                };
+                if deserialize_step != StepStatus::Pending {
+                    content = content.child(step_marker(
+                        self.steps.len() + 1,
+                        "反序列化资源",
+                        deserialize_step,
+                        cx,
+                    ));
+                    if deserialize_step == StepStatus::Failed
+                        && let Some(error) = &error
+                    {
+                        content = content.child(
+                            div()
+                                .pl_6()
+                                .text_sm()
+                                .text_color(cx.theme().danger)
+                                .child(error.clone()),
+                        );
+                    }
+                    if deserialize_step == StepStatus::Active
+                        && let Some(DeserializeState::Running { kind, downloader }) = self
+                            .deserialize
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone()
+                    {
+                        content = content
+                            .child(
+                                div().pl_6().child(
+                                    Label::new(format!("正在处理：{}", kind_label(kind)))
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground),
+                                ),
+                            )
+                            .child(download_panel(
+                                self.steps.len() + 1,
+                                Some(&downloader),
+                                None,
+                                StepStatus::Active,
+                                cx,
+                            ));
+                    }
+                }
+
+                if matches!(self.phase, Phase::Done) {
                     content = content.child(
                         div().pl_6().child(
                             Label::new(format!(
                                 "已安装 {}",
-                                self.installed_name.as_deref().unwrap_or("整合包")
+                                self.installed_project
+                                    .as_ref()
+                                    .map(|project| project.name.as_str())
+                                    .unwrap_or("整合包")
                             ))
                             .text_sm(),
                         ),
