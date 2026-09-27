@@ -135,12 +135,12 @@ pub fn git_backend_info<P: AsRef<Path>>(path: P) -> Option<GitBackendInfo> {
 /// 纳入版本管理。
 fn default_ignores(path: &Path) -> Vec<String> {
     let mut entries = [
-        ".rev_launcher/logs",
-        ".rev_launcher/natives",
-        "logs",
-        "mods",
-        "resourcepacks",
-        "shaderpacks",
+        "/.rev_launcher/logs/",
+        "/.rev_launcher/natives/",
+        "/logs/",
+        "/mods/",
+        "/resourcepacks/",
+        "/shaderpacks/",
     ]
     .into_iter()
     .map(str::to_owned)
