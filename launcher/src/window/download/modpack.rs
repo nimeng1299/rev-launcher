@@ -36,8 +36,10 @@ use super::dialog::{
 };
 use super::dir_select::DirSelect;
 
-/// 整合包安装页的内容区：仓库地址一行 + 文件拖放框。
+/// 整合包安装页的内容区：安装目录一行 + 仓库地址一行 + 文件拖放框。
 pub(super) struct ModpackPage {
+    /// 安装目录选择框，和其他页面的一致。
+    dir_select: Entity<DirSelect>,
     /// 仓库地址输入框。
     url_input: Entity<InputState>,
     /// 拖进来的整合包文件；安装功能还没实现，先记下来展示。
@@ -48,13 +50,14 @@ pub(super) struct ModpackPage {
 impl ModpackPage {
     pub(super) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
+            dir_select: cx.new(|cx| DirSelect::new(window, cx)),
             url_input: cx.new(|cx| InputState::new(window, cx).placeholder("整合包 Git 仓库地址")),
             dropped_files: Vec::new(),
             focus_handle: cx.focus_handle(),
         }
     }
 
-    /// 点「从 Git 安装」：校验地址后打开安装对话框。
+    /// 点「从 Git 安装」：校验地址和安装目录后打开安装对话框。
     fn open_git_install_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if window.has_active_dialog(cx) {
             return;
@@ -64,8 +67,13 @@ impl ModpackPage {
             window.push_notification((NotificationType::Error, "请先输入仓库地址"), cx);
             return;
         }
+        // 目录在页面上选好，对话框里只展示不再改。
+        let Some(root) = self.dir_select.read(cx).selected().cloned() else {
+            window.push_notification((NotificationType::Error, "请先选择安装目录"), cx);
+            return;
+        };
 
-        let dialog = cx.new(|cx| GitInstallDialog::new(url, window, cx));
+        let dialog = cx.new(|cx| GitInstallDialog::new(url, root, window, cx));
         GitInstallDialog::open(dialog, window, cx);
     }
 
@@ -143,6 +151,13 @@ impl Render for ModpackPage {
             .gap_3()
             .child(
                 div()
+                    .v_flex()
+                    .gap_1()
+                    .child(Label::new("安装目录").text_sm())
+                    .child(self.dir_select.clone()),
+            )
+            .child(
+                div()
                     .h_flex()
                     .w_full()
                     .gap_2()
@@ -173,10 +188,10 @@ impl Render for ModpackPage {
 /// 从 Git 仓库安装整合包的对话框：先克隆仓库，再按加载器安装。
 struct GitInstallDialog {
     url: String,
+    /// 安装目录；在页面上选好带进来的，对话框里只展示不再改。
+    root: PathBuf,
     /// 项目名称输入框，留空时用从地址里猜出来的仓库名。
     name_input: Entity<InputState>,
-    /// 安装目录选择框。
-    dir_select: Entity<DirSelect>,
     /// 对话框所处阶段。
     phase: Phase,
     /// 安装步骤列表（不含克隆）；克隆完成后按加载器换成对应的一套。
@@ -206,18 +221,17 @@ enum Phase {
 }
 
 impl GitInstallDialog {
-    fn new(url: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(url: String, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let name_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(repo_name_from_url(&url).unwrap_or_default())
                 .placeholder("项目名称")
         });
-        let dir_select = cx.new(|cx| DirSelect::new(window, cx));
 
         Self {
             url,
+            root,
             name_input,
-            dir_select,
             phase: Phase::Form,
             steps: &INSTALL_STEPS,
             is_forge: false,
@@ -338,12 +352,7 @@ impl GitInstallDialog {
             raw
         };
 
-        let Some(root) = self.dir_select.read(cx).selected().cloned() else {
-            self.form_error = Some("请选择安装目录".to_owned());
-            cx.notify();
-            return;
-        };
-        let dest = root.join(&name);
+        let dest = self.root.join(&name);
         if dest.exists() {
             self.form_error = Some(format!("目录已存在: {}", dest.display()));
             cx.notify();
@@ -520,15 +529,24 @@ impl Render for GitInstallDialog {
                         div()
                             .v_flex()
                             .gap_1()
-                            .child(Label::new("项目名称").text_sm())
-                            .child(Input::new(&self.name_input).w_full()),
+                            .child(Label::new("安装目录").text_sm())
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(
+                                        Label::new(self.root.to_string_lossy().to_string())
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground),
+                                    ),
+                            ),
                     )
                     .child(
                         div()
                             .v_flex()
                             .gap_1()
-                            .child(Label::new("安装目录").text_sm())
-                            .child(self.dir_select.clone()),
+                            .child(Label::new("项目名称").text_sm())
+                            .child(Input::new(&self.name_input).w_full()),
                     );
                 if let Some(error) = &self.form_error {
                     content = content.child(

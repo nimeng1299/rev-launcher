@@ -218,6 +218,10 @@ impl InstallProgress {
         self.state.store(InstallState::Failed, Ordering::SeqCst);
     }
 
+    /// 原版安装流程：下载版本清单 → 客户端 jar → 资源文件 → 写项目文件。
+    ///
+    /// name: 项目名（`<name>.json` / `<name>.jar` 的文件名部分）；
+    /// path: 项目文件夹本身（不是父目录，`<name>.jar` 等都直接放在它下面）。
     fn run_minecraft(
         &self,
         name: &str,
@@ -259,6 +263,8 @@ impl InstallProgress {
     /// Forge 安装流程：
     /// `<name>/temp` 下载并解压安装器 → 解析 `install_profile.json` →
     /// 下载支持库 → 依次执行 processors → 写出 `<name>.json`。
+    ///
+    /// name: 项目名；path: 项目文件夹本身（不是父目录）。
     fn run_forge(
         &self,
         name: &str,
@@ -382,10 +388,6 @@ impl InstallProgress {
             .and_then(std::ffi::OsStr::to_str)
             .ok_or_else(|| failed(format!("无效的项目文件夹：{}", folder.display())))?
             .to_string();
-        let parent = folder
-            .parent()
-            .ok_or_else(|| failed(format!("项目文件夹 {} 缺少父目录", folder.display())))?
-            .to_path_buf();
         let game_version = project.game_version.clone();
         let loader_version = project.loader_version.clone();
 
@@ -401,7 +403,7 @@ impl InstallProgress {
                     .ok_or_else(|| {
                         failed(format!("找不到 Minecraft {game_version} 的版本清单"))
                     })?;
-                self.run_minecraft(&name, &parent, assets_path, &url)
+                self.run_minecraft(&name, &folder, assets_path, &url)
             }
             ModLoader::Forge => {
                 // 在 Forge 版本列表里按加载器版本找到安装器信息。
@@ -419,7 +421,7 @@ impl InstallProgress {
                     })?;
                 self.run_forge(
                     &name,
-                    &parent,
+                    &folder,
                     libraries_path,
                     assets_path,
                     &java,
