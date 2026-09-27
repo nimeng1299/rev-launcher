@@ -21,7 +21,10 @@ use gpui_kit::{
 use mclib::project::versions::minecreft::{MinecreftVersions, Version};
 
 mod dialog;
+mod dir_select;
+mod modpack;
 use dialog::DownloadDialog;
+use modpack::ModpackPage;
 
 /// 下载页侧边栏里可以被选中的项。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -37,7 +40,7 @@ impl DownloadSection {
     fn label(self) -> &'static str {
         match self {
             Self::Vanilla => "原版下载",
-            Self::Modpack => "整合包下载",
+            Self::Modpack => "整合包安装",
             Self::Mods => "模组下载",
             Self::ResourcePacks => "资源包下载",
             Self::Shaders => "光影下载",
@@ -212,6 +215,8 @@ pub struct DownloadPage {
     latest: Option<(String, String)>,
     /// 原版版本列表。
     version_list: Entity<ListState<VersionListDelegate>>,
+    /// 整合包安装页的内容区。
+    modpack: Entity<ModpackPage>,
 }
 
 impl DownloadPage {
@@ -232,12 +237,14 @@ impl DownloadPage {
             // 列表自带搜索框，输入时回调 delegate 的 perform_search。
             .searchable(true)
         });
+        let modpack = cx.new(|cx| ModpackPage::new(window, cx));
 
         let mut this = Self {
             section: DownloadSection::Vanilla,
             manifest_status: ManifestStatus::Idle,
             latest: None,
             version_list,
+            modpack,
         };
         this.load_versions(window, cx);
         this
@@ -356,7 +363,7 @@ impl DownloadPage {
                 SidebarGroup::new("游戏下载").child(
                     SidebarMenu::new()
                         .child(self.menu_item(DownloadSection::Vanilla, cx))
-                        .child(self.placeholder_item(DownloadSection::Modpack)),
+                        .child(self.menu_item(DownloadSection::Modpack, cx)),
                 ),
             )
             .child(
@@ -469,7 +476,17 @@ impl DownloadPage {
 impl Render for DownloadPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let sidebar = self.render_sidebar(cx);
-        let content = self.render_vanilla(window, cx);
+        let content = match self.section {
+            DownloadSection::Vanilla => self.render_vanilla(window, cx).into_any_element(),
+            DownloadSection::Modpack => self.modpack.clone().into_any_element(),
+            _ => div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(Label::new("敬请期待"))
+                .into_any_element(),
+        };
 
         // 父容器（main_window 的内容槽）是 block 布局，这里必须用 size_full 拿确定高度，
         // 不能用 flex_1；否则侧栏的 h_full 和列表的 flex_1 都会塌缩成 0。

@@ -25,7 +25,6 @@ use gpui_kit::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
     ParentElement, Render, SharedString, Styled, Subscription, Window, div, px, uniform_list,
 };
-use rfd::AsyncFileDialog;
 use sharingan::downloader::Downloader;
 use sharingan::status::DownloadStatus;
 
@@ -38,7 +37,10 @@ use mclib::project::versions::minecreft::Version;
 use crate::data::app_data::ProjectsRevision;
 use crate::data::settings::AppSettings;
 
-const INSTALL_STEPS: [&str; 4] = [
+use super::dir_select::DirSelect;
+
+/// 原版安装的步骤列表。
+pub(super) const INSTALL_STEPS: [&str; 4] = [
     "下载版本清单",
     "下载运行文件",
     "下载资源文件",
@@ -46,7 +48,7 @@ const INSTALL_STEPS: [&str; 4] = [
 ];
 
 /// Forge 安装的步骤列表，比原版多安装器、支持库和处理器三个阶段。
-const FORGE_STEPS: [&str; 8] = [
+pub(super) const FORGE_STEPS: [&str; 8] = [
     "下载安装器",
     "下载版本清单",
     "下载运行文件",
@@ -56,61 +58,6 @@ const FORGE_STEPS: [&str; 8] = [
     "写入版本 JSON",
     "写入项目文件",
 ];
-
-/// 安装目录下拉框里的一项：设置里的版本目录、用户另选的目录，或者末尾的「浏览…」。
-///
-/// 存的是路径在 `AppSettings::project_paths` 里的下标而不是路径本身，
-/// 即使同一个路径被添加了两次，选中项也不会有歧义。
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum DirOption {
-    Project(usize),
-    Custom(PathBuf),
-    Browse,
-}
-
-#[derive(Debug, Clone)]
-struct DirOptionItem {
-    value: DirOption,
-    label: SharedString,
-}
-
-impl SearchableListItem for DirOptionItem {
-    type Value = DirOption;
-
-    fn title(&self) -> SharedString {
-        self.label.clone()
-    }
-
-    fn value(&self) -> &Self::Value {
-        &self.value
-    }
-}
-
-/// 把版本目录列表转成下拉框选项，末尾补上自定义目录和「浏览…」。
-fn dir_option_items(paths: &[PathBuf], custom: Option<&PathBuf>) -> Vec<DirOptionItem> {
-    let mut items = paths
-        .iter()
-        .enumerate()
-        .map(|(ix, path)| DirOptionItem {
-            value: DirOption::Project(ix),
-            label: SharedString::from(path.to_string_lossy().to_string()),
-        })
-        .collect::<Vec<_>>();
-
-    if let Some(path) = custom {
-        items.push(DirOptionItem {
-            value: DirOption::Custom(path.clone()),
-            label: SharedString::from(format!("{}（自定义）", path.to_string_lossy())),
-        });
-    }
-
-    items.push(DirOptionItem {
-        value: DirOption::Browse,
-        label: SharedString::from("浏览…"),
-    });
-
-    items
-}
 
 /// 附加加载器选项：原版不装加载器，Forge 需要再选一个 Forge 版本。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,14 +114,14 @@ enum ForgeList {
 
 /// 下载状态：`None` 还在表单阶段，`Running` 携带当前步骤下标。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InstallStatus {
+pub(super) enum InstallStatus {
     Running(usize),
     Done,
     Failed(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StepStatus {
+pub(super) enum StepStatus {
     Pending,
     Active,
     Complete,
@@ -182,7 +129,7 @@ enum StepStatus {
     Skipped,
 }
 
-fn step_status(index: usize, status: InstallStatus) -> StepStatus {
+pub(super) fn step_status(index: usize, status: InstallStatus) -> StepStatus {
     match status {
         InstallStatus::Done => StepStatus::Complete,
         InstallStatus::Running(current) => {
@@ -207,7 +154,7 @@ fn step_status(index: usize, status: InstallStatus) -> StepStatus {
 }
 
 /// 把安装状态映射到步骤下标；Forge 和原版的步骤含义不同。
-fn step_index(state: InstallState, forge: bool) -> usize {
+pub(super) fn step_index(state: InstallState, forge: bool) -> usize {
     match state {
         InstallState::Ready | InstallState::DownloadInstaller => 0,
         InstallState::DownloadVersionJson => {
@@ -238,7 +185,7 @@ fn step_index(state: InstallState, forge: bool) -> usize {
     }
 }
 
-fn step_marker(index: usize, label: &str, status: StepStatus, cx: &App) -> Marker {
+pub(super) fn step_marker(index: usize, label: &str, status: StepStatus, cx: &App) -> Marker {
     let (text, color) = match status {
         StepStatus::Pending => ("等待中", cx.theme().muted_foreground),
         StepStatus::Active => ("进行中", cx.theme().primary),
@@ -348,7 +295,7 @@ fn bytes(value: u64) -> String {
 
 /// 下载步骤下方的明细面板：汇总计数、正在下载的条目（带进度条和速度）
 /// 以及排队/失败文件列表。与启动弹窗的下载面板布局一致。
-fn download_panel(
+pub(super) fn download_panel(
     index: usize,
     downloader: Option<&Downloader>,
     names: Option<&HashMap<String, String>>,
@@ -490,14 +437,81 @@ fn download_panel(
     panel.into_any_element()
 }
 
+/// 给安装处理器挑一个 Java：优先全局设置里指定的，其次是默认项，最后取扫描到的第一个。
+pub(super) fn resolve_java(cx: &App) -> Result<JavaVersion, String> {
+    let settings = cx.global::<AppSettings>();
+    settings
+        .global_settings
+        .java
+        .clone()
+        .or_else(|| {
+            settings
+                .default_java_version
+                .and_then(|ix| settings.java_versions.get(ix).cloned())
+        })
+        .or_else(|| settings.java_versions.first().cloned())
+        .ok_or_else(|| "未找到可用的 Java，请先在设置中添加 Java".to_owned())
+}
+
+/// 校验项目名称：空、路径分隔符和相对路径片段都不允许。
+pub(super) fn validate_project_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.starts_with('.')
+        || name.contains("..")
+        || name.chars().any(|c| c == '/' || c == '\\')
+    {
+        return Err(format!("无效的项目名称: {name}"));
+    }
+    Ok(())
+}
+
+/// 该步骤是否对应一个文件下载阶段（有明细面板可展示）。
+pub(super) fn is_download_step(is_forge: bool, index: usize) -> bool {
+    if is_forge {
+        // 下载运行文件 / 下载支持库 / 下载资源文件
+        matches!(index, 2..=4)
+    } else {
+        // 下载运行文件 / 下载资源文件
+        matches!(index, 1 | 2)
+    }
+}
+
+/// 步骤下标对应的下载器；不是下载阶段或下载器尚未创建时返回 `None`。
+pub(super) fn step_downloader(
+    progress: Option<&InstallProgress>,
+    is_forge: bool,
+    index: usize,
+) -> Option<Arc<Downloader>> {
+    let progress = progress?;
+    if is_forge {
+        match index {
+            2 => progress.jar_downloader(),
+            3 => progress.libraries_downloader(),
+            4 => progress.assets_downloader(),
+            _ => None,
+        }
+    } else {
+        match index {
+            1 => progress.jar_downloader(),
+            2 => progress.assets_downloader(),
+            _ => None,
+        }
+    }
+}
+
+/// 该步骤是否是资源文件下载（文件名是 hash，需要用逻辑路径映射展示）。
+pub(super) fn is_assets_step(is_forge: bool, index: usize) -> bool {
+    if is_forge {
+        index == 4
+    } else {
+        index == 2
+    }
+}
+
 pub(super) struct DownloadDialog {
     version: Version,
-    /// 安装目录下拉框。
-    dir_select: Entity<SelectState<Vec<DirOptionItem>>>,
-    /// 下拉框当前确认的值，`Browse` 只触发文件选择，不会被记住。
-    selected_dir: Option<DirOption>,
-    /// 用户通过「浏览…」另选的目录。
-    custom_dir: Option<PathBuf>,
+    /// 安装目录选择框。
+    dir_select: Entity<DirSelect>,
     /// 项目名称输入框，留空时默认用版本号。
     name_input: Entity<InputState>,
     /// 加载器下拉框。
@@ -523,7 +537,6 @@ pub(super) struct DownloadDialog {
     /// 下载成功后创建出来的项目名，结果页展示用。
     installed_name: Option<String>,
     focus_handle: FocusHandle,
-    _dir_subscription: Subscription,
     _loader_subscription: Subscription,
     _forge_subscription: Subscription,
 }
@@ -534,85 +547,8 @@ impl DownloadDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let paths = cx.global::<AppSettings>().project_paths.clone();
-        // 有版本目录就默认选中第一个。
-        let selected_dir = (!paths.is_empty()).then_some(DirOption::Project(0));
-        let dir_select = cx.new(|cx| {
-            SelectState::new(
-                dir_option_items(&paths, None),
-                selected_dir.as_ref().map(|_| IndexPath::new(0)),
-                window,
-                cx,
-            )
-        });
-
-        let dir_subscription = cx.subscribe_in(
-            &dir_select,
-            window,
-            |this: &mut Self, _state, event: &SelectEvent<Vec<DirOptionItem>>, window, cx| {
-                match event {
-                    SelectEvent::Confirm(Some(DirOption::Project(ix))) => {
-                        this.selected_dir = Some(DirOption::Project(*ix));
-                    }
-                    SelectEvent::Confirm(Some(DirOption::Custom(path))) => {
-                        this.selected_dir = Some(DirOption::Custom(path.clone()));
-                    }
-                    // 「浏览…」不是真正的目录：把下拉框拨回当前项，再弹系统目录选择框。
-                    SelectEvent::Confirm(Some(DirOption::Browse)) => {
-                        // 此刻还在 SelectState 自己的更新栈上，直接回头改它会重入更新，
-                        // 因此推到本轮效果跑完后再拨回去。
-                        cx.defer_in(window, move |this, window, cx| {
-                            let index = this
-                                .dir_select
-                                .read(cx)
-                                .selected_index(cx)
-                                .filter(|ix| ix.row < this.dir_item_count(cx) - 1);
-                            this.dir_select.update(cx, |state, cx| {
-                                state.set_selected_index(index, window, cx);
-                            });
-
-                            let this = cx.entity().downgrade();
-                            window
-                                .spawn(cx, async move |cx| {
-                                    let file = AsyncFileDialog::new()
-                                        .set_title("选择安装目录")
-                                        .pick_folder()
-                                        .await;
-                                    let Some(file) = file else {
-                                        return;
-                                    };
-                                    let path = file.path().to_path_buf();
-
-                                    let _ = this.update_in(cx, |this, window, cx| {
-                                        this.custom_dir = Some(path.clone());
-                                        this.selected_dir =
-                                            Some(DirOption::Custom(path.clone()));
-
-                                        // 自定义目录总是倒数第二项（「浏览…」固定在最后）。
-                                        let paths =
-                                            cx.global::<AppSettings>().project_paths.clone();
-                                        let items = dir_option_items(&paths, Some(&path));
-                                        let custom_index = IndexPath::new(items.len() - 2);
-                                        this.dir_select.update(cx, |state, cx| {
-                                            state.set_items(items, window, cx);
-                                            state.set_selected_index(
-                                                Some(custom_index),
-                                                window,
-                                                cx,
-                                            );
-                                        });
-                                        cx.notify();
-                                    });
-                                })
-                                .detach();
-                        });
-                    }
-                    SelectEvent::Confirm(None) => {
-                        this.selected_dir = None;
-                    }
-                }
-            },
-        );
+        // 安装目录选择框，选中的目录在开始安装时读取。
+        let dir_select = cx.new(|cx| DirSelect::new(window, cx));
 
         let name_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -675,8 +611,6 @@ impl DownloadDialog {
         Self {
             version,
             dir_select,
-            selected_dir,
-            custom_dir: None,
             name_input,
             loader_select,
             loader: LoaderKind::Vanilla,
@@ -690,7 +624,6 @@ impl DownloadDialog {
             error: Arc::new(Mutex::new(None)),
             installed_name: None,
             focus_handle: cx.focus_handle(),
-            _dir_subscription: dir_subscription,
             _loader_subscription: loader_subscription,
             _forge_subscription: forge_subscription,
         }
@@ -736,40 +669,13 @@ impl DownloadDialog {
         .detach();
     }
 
-    /// 给安装处理器挑一个 Java：优先全局设置里指定的，其次是默认项，最后取扫描到的第一个。
-    fn resolve_java(&self, cx: &App) -> Result<JavaVersion, String> {
-        let settings = cx.global::<AppSettings>();
-        settings
-            .global_settings
-            .java
-            .clone()
-            .or_else(|| {
-                settings
-                    .default_java_version
-                    .and_then(|ix| settings.java_versions.get(ix).cloned())
-            })
-            .or_else(|| settings.java_versions.first().cloned())
-            .ok_or_else(|| "未找到可用的 Java，请先在设置中添加 Java".to_owned())
-    }
-
-    /// 下拉框里有多少项。
-    fn dir_item_count(&self, cx: &App) -> usize {
-        let paths = cx.global::<AppSettings>().project_paths.len();
-        paths + if self.custom_dir.is_some() { 1 } else { 0 } + 1
-    }
-
-    /// 表单阶段解析出来的安装目录；没选版本目录也没有自定义目录时报错。
+    /// 表单阶段解析出来的安装目录；没选目录时报错。
     fn resolve_root(&self, cx: &App) -> Result<PathBuf, String> {
-        match &self.selected_dir {
-            Some(DirOption::Project(ix)) => cx
-                .global::<AppSettings>()
-                .project_paths
-                .get(*ix)
-                .cloned()
-                .ok_or_else(|| "选择的版本目录已不存在".to_owned()),
-            Some(DirOption::Custom(path)) => Ok(path.clone()),
-            Some(DirOption::Browse) | None => Err("请选择安装目录".to_owned()),
-        }
+        self.dir_select
+            .read(cx)
+            .selected()
+            .cloned()
+            .ok_or_else(|| "请选择安装目录".to_owned())
     }
 
     /// 解析项目名称：输入框留空时用版本号；非法字符直接拦下来。
@@ -782,13 +688,7 @@ impl DownloadDialog {
             name
         };
 
-        if name.is_empty()
-            || name.starts_with('.')
-            || name.contains("..")
-            || name.chars().any(|c| c == '/' || c == '\\')
-        {
-            return Err(format!("无效的项目名称: {name}"));
-        }
+        validate_project_name(name)?;
         Ok(name.to_owned())
     }
 
@@ -801,41 +701,17 @@ impl DownloadDialog {
 
     /// 该步骤是否对应一个文件下载阶段（有明细面板可展示）。
     fn is_download_step(&self, index: usize) -> bool {
-        if self.loader == LoaderKind::Forge {
-            // 下载运行文件 / 下载支持库 / 下载资源文件
-            matches!(index, 2..=4)
-        } else {
-            // 下载运行文件 / 下载资源文件
-            matches!(index, 1 | 2)
-        }
+        is_download_step(self.loader == LoaderKind::Forge, index)
     }
 
     /// 步骤下标对应的下载器；该步骤不是下载阶段或下载器尚未创建时返回 `None`。
     fn step_downloader(&self, index: usize) -> Option<Arc<Downloader>> {
-        let progress = self.progress.as_ref()?;
-        if self.loader == LoaderKind::Forge {
-            match index {
-                2 => progress.jar_downloader(),
-                3 => progress.libraries_downloader(),
-                4 => progress.assets_downloader(),
-                _ => None,
-            }
-        } else {
-            match index {
-                1 => progress.jar_downloader(),
-                2 => progress.assets_downloader(),
-                _ => None,
-            }
-        }
+        step_downloader(self.progress.as_ref(), self.loader == LoaderKind::Forge, index)
     }
 
     /// 该步骤是否是资源文件下载（文件名是 hash，需要用逻辑路径映射展示）。
     fn is_assets_step(&self, index: usize) -> bool {
-        if self.loader == LoaderKind::Forge {
-            index == 4
-        } else {
-            index == 2
-        }
+        is_assets_step(self.loader == LoaderKind::Forge, index)
     }
 
     /// 点「下载」：校验表单，然后交给 `InstallProgress::install_minecraft`
@@ -891,7 +767,7 @@ impl DownloadDialog {
             None
         };
         let java = if forge_version.is_some() {
-            match self.resolve_java(cx) {
+            match resolve_java(cx) {
                 Ok(java) => Some(java),
                 Err(error) => {
                     self.form_error = Some(error);
@@ -1042,7 +918,7 @@ impl DownloadDialog {
                                         .on_click({
                                             let dialog = dialog.clone();
                                             move |_, window, cx| {
-                                                let _ = dialog.update(cx, |dialog, cx| {
+                                                dialog.update(cx, |dialog, cx| {
                                                     dialog.start_install(window, cx);
                                                 });
                                             }
@@ -1079,11 +955,7 @@ impl Render for DownloadDialog {
                             .v_flex()
                             .gap_1()
                             .child(Label::new("安装目录").text_sm())
-                            .child(
-                                Select::new(&self.dir_select)
-                                    .w_full()
-                                    .placeholder("选择安装目录"),
-                            ),
+                            .child(self.dir_select.clone()),
                     )
                     .child(
                         div()

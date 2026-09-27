@@ -1005,6 +1005,200 @@ pub fn push_remote<P: AsRef<Path>>(path: P, remote: &str) -> anyhow::Result<Stri
     })
 }
 
+/// 克隆一个 Git 仓库到空目录（等价于 `jj git clone`）。
+///
+/// 目标目录会初始化成 colocated 仓库（.git 与工作副本同目录，和启动器里
+/// 其它项目一致），远程固定叫 `origin`，取回全部 bookmark 和 tag，给远程
+/// 默认分支建一个本地跟踪 bookmark，并把工作副本切到默认分支的最新提交上。
+/// 返回一句话摘要（含默认分支名），界面直接拿它当通知正文。
+///
+/// 目标目录必须不存在或为空；克隆失败时，本次新建的目录会被清理掉。
+pub fn clone<P: AsRef<Path>>(source: &str, dest: P) -> anyhow::Result<String> {
+    let dest = dest.as_ref();
+    if dest.exists() {
+        let empty = dest
+            .read_dir()
+            .is_ok_and(|mut entries| entries.next().is_none());
+        anyhow::ensure!(
+            empty,
+            "目标目录已存在且不是空目录：{}",
+            dest.display()
+        );
+    }
+    let created = !dest.exists();
+    std::fs::create_dir_all(dest)?;
+
+    match clone_workspace(source, dest) {
+        Ok(summary) => Ok(summary),
+        Err(error) => {
+            if created {
+                let _ = std::fs::remove_dir_all(dest);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// [`clone`] 的实体：目标目录已就位，失败时不需要再清理。
+fn clone_workspace(source: &str, path: &Path) -> anyhow::Result<String> {
+    let settings = user_settings::create_user_settings(Some(path))?;
+    let git_settings = GitSettings::from_settings(&settings)?;
+    let remote_name = RemoteName::new("origin");
+
+    // 1. 建一个空的 Git 仓库再挂上 jj，和 init_git_backend 的做法一致。
+    let status = Command::new("git")
+        .arg("init")
+        .arg("--")
+        .arg(path)
+        .status()
+        .context("failed to run git init")?;
+    if !status.success() {
+        anyhow::bail!("git init exited with status {status}");
+    }
+    let (_workspace, repo) = Workspace::init_external_git(&settings, path, &path.join(".git"))
+        .block_on()
+        .context("failed to initialize jj workspace")?;
+
+    // 2. 记录远程地址；配置落进 .git/config 之后要从磁盘重新加载 workspace，
+    //    否则 GitBackend 缓存的 gix 仓库实例看不到新写的 remote。
+    {
+        let mut transaction = repo.start_transaction();
+        jj_lib::git::add_remote(transaction.repo_mut(), remote_name, source, None)
+            .context("failed to add git remote")?;
+        transaction
+            .commit("add git remote origin")
+            .block_on()
+            .context("failed to save the remote")?;
+    }
+    let mut workspace = load_workspace(path)?;
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .block_on()
+        .context("failed to load repository")?;
+
+    // 3. 取回全部 bookmark/tag 并导入；自动跟踪留空，默认分支在下一步手动跟踪，
+    //    和 `jj git clone` 跟踪默认分支的行为一致。
+    let expanded = expand_fetch_refspecs(
+        remote_name,
+        GitFetchRefExpression {
+            bookmark: StringExpression::all(),
+            tag: StringExpression::all(),
+        },
+    )?;
+    // 克隆会一次带进大量新提交，不需要给它们记合成前驱。
+    let import_options = GitImportOptions {
+        abandon_unreachable_commits: git_settings.abandon_unreachable_commits,
+        record_synthetic_predecessors: false,
+        remote_auto_track_bookmarks: HashMap::new(),
+    };
+    let mut git_output = GitOutput::default();
+    let mut transaction = repo.start_transaction();
+    let default_branch = {
+        let mut fetch = GitFetch::new(
+            transaction.repo_mut(),
+            git_settings.to_subprocess_options(),
+            &import_options,
+        )?;
+        fetch
+            .fetch(remote_name, expanded, &mut git_output, None)
+            .map_err(|error| anyhow!("{error}{}", git_output.detail()))?;
+        fetch
+            .import_refs()
+            .block_on()
+            .map_err(|error| anyhow!("{error}{}", git_output.detail()))?;
+        fetch
+            .get_default_branch(remote_name)
+            .map_err(|error| anyhow!("{error}{}", git_output.detail()))?
+    };
+
+    // 4. 远程默认分支建一个本地跟踪 bookmark（和 git clone 的行为一致）。
+    let Some(branch) = default_branch else {
+        anyhow::bail!("远程仓库没有默认分支{}", git_output.detail());
+    };
+    let symbol = RemoteRefSymbol {
+        name: &branch,
+        remote: remote_name,
+    };
+    if transaction
+        .repo()
+        .view()
+        .get_remote_bookmark(symbol)
+        .target
+        .as_normal()
+        .is_some()
+    {
+        transaction
+            .repo_mut()
+            .track_remote_bookmark(symbol)
+            .block_on()
+            .context("failed to track the default bookmark")?;
+    }
+    let repo = transaction
+        .commit("fetch from git remote into empty repo")
+        .block_on()
+        .context("failed to save the fetched refs")?;
+
+    // 5. 把工作副本切到默认分支的最新提交上（磁盘上落出仓库里的文件）。
+    let Some(commit_id) = repo
+        .view()
+        .get_remote_bookmark(symbol)
+        .target
+        .as_normal()
+        .cloned()
+    else {
+        anyhow::bail!(
+            "远程仓库的默认分支 {} 没有指向任何提交",
+            branch.as_str()
+        );
+    };
+    let commit = repo
+        .store()
+        .get_commit(&commit_id)
+        .context("failed to read the default branch commit")?;
+    let mut transaction = repo.start_transaction();
+    let wc_commit = transaction
+        .repo_mut()
+        .check_out(workspace.workspace_name().to_owned(), &commit)
+        .block_on()
+        .context("failed to check out the default branch")?;
+    // 换工作副本提交会放弃原来的空提交，这是一次重写，提交事务前要 rebase 后代。
+    rebase_rewritten_descendants(&mut transaction, &repo, &workspace, path)?;
+    // 把 jj 里的 bookmark/tag 导出回 .git，colocated 仓库里 git 工具才能看到；
+    // 顺带把 git HEAD 挪到工作副本提交上。
+    jj_lib::git::export_refs(transaction.repo_mut())
+        .context("failed to export git refs")?;
+    let repo = transaction
+        .commit(format!(
+            "check out git remote's branch: {}",
+            branch.as_str()
+        ))
+        .block_on()
+        .context("failed to save the checkout")?;
+    workspace
+        .check_out(repo.op_id().clone(), None, &wc_commit)
+        .block_on()
+        .context("failed to update the working copy")?;
+
+    // git HEAD 还指着 git init 时记下的默认分支名（通常是 master），
+    // 把它拨到真正的默认分支上：colocated 仓库里 git 工具打开才能看到
+    // 正确的分支；工作副本的树和分支指向的树一致，git status 也是干净的。
+    let head_ref = format!("refs/heads/{}", branch.as_str());
+    let status = Command::new("git")
+        .args(["symbolic-ref", "HEAD", &head_ref])
+        .current_dir(path)
+        .status()
+        .context("failed to run git symbolic-ref")?;
+    if !status.success() {
+        anyhow::bail!("git symbolic-ref exited with status {status}");
+    }
+
+    Ok(format!(
+        "已克隆 {source}（默认分支 {}）",
+        branch.as_str()
+    ))
+}
+
 /// 把界面上的提交 id（十六进制字符串）解析成 [`CommitId`]。
 fn parse_commit_id(commit_id: &str) -> anyhow::Result<CommitId> {
     CommitId::try_from_hex(commit_id.as_bytes())
@@ -1807,5 +2001,53 @@ mod tests {
             .find(|file| file.path == path)
             .unwrap_or_else(|| panic!("{path} 不在改动列表里：{:?}", changes.files))
             .lines
+    }
+
+    /// 克隆本地仓库：文件落盘、是 jj 仓库、摘要里带默认分支；
+    /// 目标目录已存在时直接报错。
+    #[test]
+    fn clone_local_repo_checks_out_default_branch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(&source).expect("create source");
+
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&source)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} 失败");
+        };
+        run(&["init", "-b", "main", "--", "."]);
+        std::fs::write(source.join("project.json"), "{}").expect("write file");
+        run(&["add", "."]);
+        run(&[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ]);
+
+        // 正常克隆：工作副本里能看到仓库内容。
+        let dest = temp.path().join("MyPack");
+        let summary =
+            clone(source.to_str().expect("source path"), &dest).expect("clone");
+        assert!(summary.contains("main"), "摘要里要有默认分支：{summary}");
+        assert!(dest.join("project.json").is_file(), "文件要落到工作副本");
+        assert!(dest.join(".git").exists(), "colocated 仓库要有 .git");
+        assert!(is_repo(&dest));
+        assert_eq!(
+            git_backend_info(&dest).and_then(|info| info.branch),
+            Some("main".to_owned())
+        );
+
+        // 目标目录已存在且非空时不能克隆。
+        let error = clone(source.to_str().expect("source path"), &dest)
+            .expect_err("non-empty dest");
+        assert!(error.to_string().contains("目标目录"), "{error}");
     }
 }
