@@ -1791,8 +1791,8 @@ mod tests {
             .and_then(|name| name.to_str())
             .expect("folder name")
             .to_owned();
-        assert!(expected.contains(&format!("{folder}.jar")));
-        assert!(expected.contains(&format!("{folder}.json")));
+        assert!(expected.contains(&format!("/{folder}.jar")));
+        assert!(expected.contains(&format!("/{folder}.json")));
         assert!(!expected.iter().any(|entry| entry.contains('*')));
 
         // 全新的项目：整份默认忽略都写进去，而且不写注释
