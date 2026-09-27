@@ -7,6 +7,7 @@ use gpui_kit::{AppContext, Bounds, Point, Size, WindowBounds, px};
 
 pub mod data;
 pub mod jj;
+pub mod key;
 pub mod window;
 
 pub fn run_app() {
