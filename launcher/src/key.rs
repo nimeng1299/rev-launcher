@@ -2,19 +2,18 @@ static MC_KEY: &str = env!("MC_KEY");
 
 pub fn get_mc_key() -> String {
     if cfg!(not(has_mc_key)) {
-        // 这条语句只在非 debug 下执行
         println!("release only");
     }
 
     decrypt(MC_KEY)
 }
 
-pub fn encrypt(input: &str) -> String {
+#[allow(dead_code)]
+fn encrypt(input: &str) -> String {
     shift_by_position(input, false)
 }
 
-// encrypt 的逆操作
-pub fn decrypt(input: &str) -> String {
+fn decrypt(input: &str) -> String {
     shift_by_position(input, true)
 }
 
